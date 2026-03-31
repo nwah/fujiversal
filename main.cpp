@@ -3,6 +3,7 @@
 #include "FujiBusPacket.h"
 #include "fujiDeviceID.h"
 #include "fujiCommandID.h"
+#include "fujiROMType.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -46,9 +47,13 @@
 #define ring_append(x) ({ring_buffer[ring_in] = x; \
       ring_in = (ring_in + 1) % sizeof(ring_buffer); })
 
-uint8_t ramrom[ROM_MAX_SEGS * ROM_SEG_SIZE];
+// uint8_t ramrom[ROM_MAX_SEGS * ROM_SEG_SIZE];
+uint8_t ramrom[0x40000]; // 256kB
 int ramrom_pos = -1;
 uint8_t *ramrom_ptr = nullptr;
+fujiROMType_t ramrom_type = ROM_TYPE_UNKNOWN;
+uint32_t region_offsets[ROM_MAX_SEGS];
+uint16_t region_size = ROM_SEG_SIZE;
 volatile bool userrom_ready = false;
 volatile bool userrom_active = false;
 
@@ -81,7 +86,7 @@ void setup_pio_irq_logic()
   // Initialize the Address pins
   for (int pin = A0_PIN; pin < A0_PIN + 16; pin++)
     pio_gpio_init(pio0, pin);
-    
+
 // Invert /CE pin to make it easer to use JMP in PIO
   pio_gpio_init(pio0, CE_PIN);
   gpio_set_inover(CE_PIN, GPIO_OVERRIDE_INVERT);
@@ -129,7 +134,8 @@ void __time_critical_func(romulan)(void)
   uint32_t addrdata, addr, data;
   uint32_t rom_offset, rom_size = POW2_CEIL(sizeof(ROM));
   uint32_t last_addr = -1;
-
+  uint8_t region = 0;
+  bool is_write = false;
 
   setup_pio_irq_logic();
 
@@ -141,6 +147,8 @@ void __time_critical_func(romulan)(void)
     addr = (addrdata >> 4) & 0xFFFF;
     if (addr == last_addr)
       continue;
+
+    is_write = addrdata & 2;
 
     data = (addrdata >> (18 + 4)) & 0xFF;
 
@@ -164,10 +172,63 @@ void __time_critical_func(romulan)(void)
         break;
       }
     }
+    else if (is_write) {
+        region = 0;
+        switch (ramrom_type) {
+            case ROM_TYPE_MSX_ASCII8:
+                if ((0x6000 <= addr) && (addr < 0x8000)) {
+                    region = (addr >> 11) & 3;
+                }
+                break;
+            case ROM_TYPE_MSX_ASCII16:
+                if ((0x6000 <= addr) && (addr < 0x7800) && !(addr & 0x0800)) {
+              		region = (addr >> 12) & 1;
+               	}
+                break;
+            case ROM_TYPE_MSX_KONAMI:
+                // [0x4000..0x6000) is fixed at segment 0.
+               	if (0x6000 <= addr && addr < 0xC000) {
+                    region = (addr >> 13) - 2;
+               	}
+                break;
+            case ROM_TYPE_MSX_KONAMI_SCC:
+               	if (0x5000 <= addr && addr < 0xC000 && (addr & 0x1800) == 0x1000) {
+                    region = (addr >> 13) - 2;
+               	}
+                break;
+            default:
+                break;
+        }
+        region_offsets[region] = region_size == 0x2000 ? (data << 13) : (data << 14);
+    }
+    else if (userrom_active && ramrom_ptr) {
+      // rom_offset = addr - MSX_PAGE_SIZE;
+      // region = region_size == 0x2000 ? (rom_offset >> 13) : (rom_offset >> 14);
+      //
+      if (ramrom_type == ROM_TYPE_MSX_KONAMI) {
+        // [0x0000, 0x4000) mirrors [0x4000, 0x8000)
+        if (addr < 0x4000) addr += 0x4000;
+        // [0xC000, 0x10000) mirrors [0x8000, 0xC000)
+        else if (addr >= 0xC000) addr -= 0x4000;
+      }
+      else if (ramrom_type == ROM_TYPE_MSX_KONAMI) {
+        // [0x0000, 0x4000) mirrors [0xC000, 0x10000)
+        if (addr < 0x4000) addr += 0x8000;
+        // [0xC000, 0x10000) mirrors [0x4000, 0x8000)
+        else if (addr >= 0xC000) addr -= 0x8000;
+      }
+
+      rom_offset = addr & (region_size - 1); // 0x3FFF or 0x1FFF
+      region = region_size == 0x2000 ? (addr >> 13) - 2: (addr >> 14) - 1; // TODO: handle different start addresses
+
+      if (region < 0 || region > ROM_MAX_SEGS)
+        continue;
+
+      pio0->txf[SM_READ] = ramrom_ptr[rom_offset + region_offsets[region]];
+    }
     else if (MSX_PAGE_SIZE <= addr && addr < MSX_PAGE_SIZE * 3) {
       rom_offset = addr - MSX_PAGE_SIZE;
-      //rom_offset &= POW2_CEIL(sizeof(ROM)) - 1;
-      pio0->txf[SM_READ] = (userrom_active && ramrom_ptr) ? ramrom_ptr[rom_offset] : ROM[rom_offset];
+      pio0->txf[SM_READ] = ROM[rom_offset];
     }
 
     last_addr = addr;
@@ -205,9 +266,12 @@ void process_command(std::string &buffer)
       size_t offset = packet->param(0) * ROM_SEG_SIZE;
       offset %= sizeof(ramrom);
       printf("Opening RAM at 0x%04x\n", offset);
+      ramrom_type = (fujiROMType_t)packet->param(1);
       ramrom_ptr = &ramrom[offset];
       ramrom_pos = 0;
       userrom_ready = false;
+      // if high bit of type is set, mapper uses 16K blocks, else 8K
+      region_size = ramrom_type & 0x80 ? 0x4000 : 0x2000;
       sendReplyPacket(packet->device(), true, nullptr, 0);
     }
     break;
@@ -231,7 +295,8 @@ void process_command(std::string &buffer)
   case FUJICMD_CLOSE:
     if (ramrom_pos < 0 || !ramrom_ptr)
       sendReplyPacket(packet->device(), false, nullptr, 0);
-
+    for (int i = 0; i < ROM_MAX_SEGS; i++)
+      region_offsets[i] = i * region_size;
     ramrom_pos = -1;
     userrom_ready = true;
     printf("Closing RAM %d\n", userrom_ready);
