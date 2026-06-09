@@ -5,6 +5,7 @@
 #include "fujiCommandID.h"
 #include "fujiROMType.h"
 
+#include <cstdint>
 #include <stdio.h>
 #include <string.h>
 #include <pico/stdlib.h>
@@ -13,6 +14,7 @@
 #include <hardware/irq.h>
 #include <hardware/sync.h>
 
+#include <array>
 #include <string>
 
 #define IO_BASE    0xBFFC
@@ -52,7 +54,7 @@ uint8_t ramrom[0x40000]; // 256kB
 int ramrom_pos = -1;
 uint8_t *ramrom_ptr = nullptr;
 fujiROMType_t ramrom_type = ROM_TYPE_UNKNOWN;
-uint32_t region_offsets[ROM_MAX_SEGS];
+std::array<uint32_t, ROM_MAX_SEGS> region_offsets;
 uint16_t region_size = ROM_SEG_SIZE;
 volatile bool userrom_ready = false;
 volatile bool userrom_active = false;
@@ -134,7 +136,7 @@ void __time_critical_func(romulan)(void)
   uint32_t addrdata, addr, data;
   uint32_t rom_offset, rom_size = POW2_CEIL(sizeof(ROM));
   uint32_t last_addr = -1;
-  uint8_t region = 0;
+  int8_t region = 0;
   bool is_write = false;
 
   setup_pio_irq_logic();
@@ -167,6 +169,7 @@ void __time_critical_func(romulan)(void)
       case IO_CONTROL: // Write control reg
         if (data & 0x80) {
           userrom_active = data & 0x01;
+          // printf("userom_active = %u", userrom_active);
           __dsb();  // Data Sync Barrier
         }
         break;
@@ -177,54 +180,87 @@ void __time_critical_func(romulan)(void)
         switch (ramrom_type) {
             case ROM_TYPE_MSX_ASCII8:
                 if ((0x6000 <= addr) && (addr < 0x8000)) {
+                	// 0x6000 = 0, 0x6800 = 1, 0x7000 = 2, 0x7800 = 3
                     region = (addr >> 11) & 3;
                 }
                 break;
             case ROM_TYPE_MSX_ASCII16:
                 if ((0x6000 <= addr) && (addr < 0x7800) && !(addr & 0x0800)) {
+                	// 0x6000 = 0, 0x7000 = 1
               		region = (addr >> 12) & 1;
                	}
                 break;
             case ROM_TYPE_MSX_KONAMI:
                 // [0x4000..0x6000) is fixed at segment 0.
                	if (0x6000 <= addr && addr < 0xC000) {
+                	// 0x6000 = 3, 0x8000 = 4, 0xA000 = 5
+                 	// subtract 2 because ROM starts at 0x4000
+                  	// TODO: Support different ROM start addr
                     region = (addr >> 13) - 2;
                	}
                 break;
             case ROM_TYPE_MSX_KONAMI_SCC:
                	if (0x5000 <= addr && addr < 0xC000 && (addr & 0x1800) == 0x1000) {
+                	// 0x5000 = 2, 0x7000 = 3, 0x9000 = 4, 0xB000 = 5
+                	// subtract 2 because ROM starts at 0x4000
+                 	// TODO: Support different ROM start addr
                     region = (addr >> 13) - 2;
                	}
                 break;
             default:
                 break;
         }
-        region_offsets[region] = region_size == 0x2000 ? (data << 13) : (data << 14);
+        region_offsets[region] = region_size == 0x2000
+        	? (data << 13)  // = data * 0x2000
+         	: (data << 14); // = data * 0x4000
     }
     else if (userrom_active && ramrom_ptr) {
       // rom_offset = addr - MSX_PAGE_SIZE;
       // region = region_size == 0x2000 ? (rom_offset >> 13) : (rom_offset >> 14);
-      //
-      if (ramrom_type == ROM_TYPE_MSX_KONAMI) {
-        // [0x0000, 0x4000) mirrors [0x4000, 0x8000)
-        if (addr < 0x4000) addr += 0x4000;
-        // [0xC000, 0x10000) mirrors [0x8000, 0xC000)
-        else if (addr >= 0xC000) addr -= 0x4000;
-      }
-      else if (ramrom_type == ROM_TYPE_MSX_KONAMI) {
-        // [0x0000, 0x4000) mirrors [0xC000, 0x10000)
-        if (addr < 0x4000) addr += 0x8000;
-        // [0xC000, 0x10000) mirrors [0x4000, 0x8000)
-        else if (addr >= 0xC000) addr -= 0x8000;
-      }
 
-      rom_offset = addr & (region_size - 1); // 0x3FFF or 0x1FFF
-      region = region_size == 0x2000 ? (addr >> 13) - 2: (addr >> 14) - 1; // TODO: handle different start addresses
 
-      if (region < 0 || region > ROM_MAX_SEGS)
-        continue;
 
-      pio0->txf[SM_READ] = ramrom_ptr[rom_offset + region_offsets[region]];
+      // if (ramrom_type == ROM_TYPE_MSX_KONAMI) {
+      //   // [0x0000, 0x4000) mirrors [0x4000, 0x8000)
+      //   if (addr < 0x4000) addr += 0x4000;
+      //   // [0xC000, 0x10000) mirrors [0x8000, 0xC000)
+      //   else if (addr >= 0xC000) addr -= 0x4000;
+      // }
+      // else if (ramrom_type == ROM_TYPE_MSX_KONAMI_SCC) {
+      //   // [0x0000, 0x4000) mirrors [0xC000, 0x10000)
+      //   if (addr < 0x4000) addr += 0x8000;
+      //   // [0xC000, 0x10000) mirrors [0x4000, 0x8000)
+      //   else if (addr >= 0xC000) addr -= 0x8000;
+      // }
+
+
+
+
+
+      // rom_offset = addr - 0x4000;
+      // pio0->txf[SM_READ] = ramrom_ptr[rom_offset];
+
+
+
+
+
+      // // uint16_t bank = (address - 0x4000) / userRomBankSize; // TODO: validate bank
+      // region = (addr - 0x4000) / region_size;
+      // // uint32_t offset = userRomMap[bank];
+      // rom_offset = region_offsets[region];
+      // // return userRom[offset + address - 0x4000 - bank * userRomBankSize];
+      // pio0->txf[SM_READ] = ramrom_ptr[rom_offset + addr - 0x4000 - region * region_size];
+
+
+
+
+      // rom_offset = addr & (region_size - 1); // 0x3FFF or 0x1FFF
+      // region = region_size == 0x2000 ? (addr >> 13) - 2: (addr >> 14) - 1; // TODO: handle different start addresses
+
+      // if (region < 0 || region > ROM_MAX_SEGS)
+      //   continue;
+
+      // pio0->txf[SM_READ] = ramrom_ptr[rom_offset + region_offsets[region]];
     }
     else if (MSX_PAGE_SIZE <= addr && addr < MSX_PAGE_SIZE * 3) {
       rom_offset = addr - MSX_PAGE_SIZE;
@@ -295,11 +331,12 @@ void process_command(std::string &buffer)
   case FUJICMD_CLOSE:
     if (ramrom_pos < 0 || !ramrom_ptr)
       sendReplyPacket(packet->device(), false, nullptr, 0);
-    for (int i = 0; i < ROM_MAX_SEGS; i++)
-      region_offsets[i] = i * region_size;
+    uint32_t offset;
+    for (int i = 0, offset = 0; i < ROM_MAX_SEGS; i++, offset += region_size)
+      region_offsets[i] = offset;
     ramrom_pos = -1;
     userrom_ready = true;
-    printf("Closing RAM %d\n", userrom_ready);
+    printf("Closing RAM ready:%c / type: %u\n", userrom_ready ? 'y' : 'n', ramrom_type);
     sendReplyPacket(packet->device(), true, nullptr, 0);
     break;
 
