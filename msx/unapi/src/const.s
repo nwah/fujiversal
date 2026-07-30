@@ -18,7 +18,7 @@ APIINFO:
 	;--- Other data
 
 INITMSG:
-	db	13,10,"FujiNet UNAPI ROM 1.0B",13,10
+	db	13,10,"FujiNet UNAPI + Disk ROM 1.0B",13,10
 	db	13,10
 	db	0
 

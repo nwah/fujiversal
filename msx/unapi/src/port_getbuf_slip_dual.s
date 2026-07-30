@@ -3,25 +3,37 @@
 
 ;-----------------------------------------------------------------------------
 ; Macro to wait for a character with timeout
-; On entry: HL is timeout
+; On entry: IX is the parameter base
 ; On exit : A = received byte
 ; Destroys: F, HL
+;
+; The timeout is reloaded here rather than by the caller: port_getc_timeout
+; returns the byte in the same register it takes the timeout in, so anything
+; that let HL carry over would be waiting for the length of the byte it read
+; last, and a byte of zero would end the frame early.
 ;-----------------------------------------------------------------------------
 SLIPD_WAIT_CHAR macro timeout_label
+	ld	hl,(ix + SLIPD_PARAM_TIMEOUT)
 	call	_port_getc_timeout
 	ld	a,h		; check high byte
 	or	a
-	jr	nz,timeout_label	; if high byte is set then timed out
+	jp	nz,timeout_label	; if high byte is set then timed out
 	ld	a,l
 ENDM
 
 ;-----------------------------------------------------------------------------
 ; uint16_t port_getbuf_slip_dual(void *hdr_buf,  uint16_t hdr_len,
 ;                                void *data_buf, uint16_t data_len,
-;                                uint16_t timeout)
+;                                uint16_t timeout, uint16_t slots)
 ;
 ; Read and decode a SLIP-framed packet into two buffers.
 ; (__callee__ calling convention -- callee cleans the stack)
+;
+; slots carries the two values to write to the primary slot register: the
+; low byte selects the caller's RAM in page 2, the high byte selects this
+; ROM's slot so the IO window is reachable. Page 2 is the ROM's on entry and
+; on exit; each stored byte hands it back to RAM just long enough to write,
+; which is what allows a destination buffer in page 2.
 ;
 ; Operation:
 ; - First hdr_len bytes go to hdr_buf
@@ -40,11 +52,12 @@ ENDM
 ;
 ; Stack on entry (left-to-right push, rightmost param nearest SP):
 ;   (SP+0)  = return address
-;   (SP+2)  = timeout  (rightmost, pushed last)
-;   (SP+4)  = data_len
-;   (SP+6)  = data_buf
-;   (SP+8)  = hdr_len
-;   (SP+10) = hdr_buf          (leftmost, pushed first)
+;   (SP+2)  = slots    (rightmost, pushed last)
+;   (SP+4)  = timeout
+;   (SP+6)  = data_len
+;   (SP+8)  = data_buf
+;   (SP+10) = hdr_len
+;   (SP+12) = hdr_buf          (leftmost, pushed first)
 ;
 ; Convert ms to jiffies before calling:
 ;   PAL  (50 Hz): jiffies = ms / 20
@@ -54,13 +67,18 @@ ENDM
 ;   HL = total decoded bytes written (header + data)
 ;-----------------------------------------------------------------------------
 
-	ARG_BYTE_LEN	equ	10	; 5 words
+	ARG_BYTE_LEN	equ	12	; 6 words
 
-	SLIPD_PARAM_TIMEOUT	equ	6
-	SLIPD_PARAM_DATA_LEN	equ	8
-	SLIPD_PARAM_DATA_BUF	equ	10
-	SLIPD_PARAM_HDR_LEN	equ	12
-	SLIPD_PARAM_HDR_BUF	equ	14
+	; How much may be thrown away before a frame starts, in units of 256
+	; bytes. Comfortably more than one packet, so a late reply still syncs.
+	SLIPD_JUNK_MAX	equ	8
+
+	SLIPD_PARAM_SLOTS	equ	6
+	SLIPD_PARAM_TIMEOUT	equ	8
+	SLIPD_PARAM_DATA_LEN	equ	10
+	SLIPD_PARAM_DATA_BUF	equ	12
+	SLIPD_PARAM_HDR_LEN	equ	14
+	SLIPD_PARAM_HDR_BUF	equ	16
 
 _port_getbuf_slip_dual:
 	push	ix			; Callee-save IX
@@ -95,20 +113,41 @@ _port_getbuf_slip_dual:
 	ld	bc,(ix + SLIPD_PARAM_HDR_LEN)
 
 	; Phase 1: Sync to frame - discard until SLIP_END
+	;
+	; The per byte timeout is no protection here: a port that always claims
+	; to have a byte ready never times out, so without a bound on what may
+	; be discarded these two loops run for ever. That is not hypothetical.
+	; A cartridge whose IO window is not answering reads as FF, which is
+	; both "data available" and a byte that is not SLIP_END. IY is not
+	; counting anything yet, so it counts the rubbish.
 slipd_sync:
-	ld	hl,(ix + SLIPD_PARAM_TIMEOUT)	; get timeout into HL
 	SLIPD_WAIT_CHAR	slipd_done
 	cp	SLIP_END
-	jr	nz, slipd_sync
+	jr	z, slipd_skip_end
+	inc	iy
+	push	iy
+	pop	hl
+	ld	a, h
+	cp	SLIPD_JUNK_MAX
+	jr	c, slipd_sync
+	jp	slipd_done		; nothing that looks like a frame
 
 	; Phase 2: Skip additional SLIP_END bytes
 slipd_skip_end:
-	ld	hl,(ix + SLIPD_PARAM_TIMEOUT)	; get timeout into HL
 	SLIPD_WAIT_CHAR slipd_done
 	cp	SLIP_END
-	jr	z, slipd_skip_end
+	jr	nz, slipd_decode_start
+	inc	iy
+	push	iy
+	pop	hl
+	ld	a, h
+	cp	SLIPD_JUNK_MAX
+	jr	c, slipd_skip_end
+	jp	slipd_done		; an unbroken run of frame markers
 
 	; Phase 3: Decode - A has first data byte
+slipd_decode_start:
+	ld	iy, 0			; from here IY counts bytes written
 slipd_decode_loop:
 	cp	SLIP_END		; End of frame?
 	jr	z, slipd_done
@@ -117,8 +156,17 @@ slipd_decode_loop:
 	jr	z, slipd_handle_escape
 
 slipd_store_byte:
-	; Write byte to current buffer (DE)
+	; Write byte to current buffer (DE). Page 2 currently holds the IO
+	; window, so give it back to RAM for the store and take it again
+	; afterwards. HL is reloaded with the timeout before every read, so L
+	; is free to hold the byte across the switch.
+	ld	l, a
+	ld	a, (ix + SLIPD_PARAM_SLOTS)		; page 2 = caller's RAM
+	out	(SLOT_PORT), a
+	ld	a, l
 	ld	(de), a
+	ld	a, (ix + SLIPD_PARAM_SLOTS + 1)		; page 2 = IO window
+	out	(SLOT_PORT), a
 	inc	de
 	dec	bc
 	inc	iy

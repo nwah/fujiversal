@@ -86,23 +86,16 @@ typedef struct {
 static const uint8_t fuji_field_numbytes_table[] = {0, 1, 2, 3, 4, 2, 4, 4};
 #define fuji_field_numbytes(descr) fuji_field_numbytes_table[descr]
 
-static uint8_t msx_get_page_slot(uint8_t page)
+/* The memory mapped IO window lives in page 2, so reaching it means paging
+   this ROM's slot over whatever RAM is there. Given the current primary slot
+   register this returns the same value with page 2 pointed at the slot page 1
+   already holds, which is us: we are executing out of it. */
+static uint8_t msx_page2_to_rom(uint8_t slots)
 {
-  uint8_t v = inp(0xA8);
+  uint8_t my_slot = (slots >> 2) & 0x03;    /* page 1 = this ROM */
 
 
-  return (v >> (page * 2)) & 0x03;
-}
-
-static void msx_set_page_slot(uint8_t page, uint8_t slot)
-{
-  uint8_t v = inp(0xA8);
-  uint8_t shift = page * 2;
-  uint8_t mask = 0x03 << shift;
-
-
-  v = (v & ~mask) | ((slot & 0x03) << shift);
-  outp(0xA8, v);
+  return (slots & 0xCF) | (my_slot << 4);   /* page 2 = the same slot */
 }
 
 static uint16_t fuji_calc_checksum(const void *ptr, uint16_t len, uint16_t seed)
@@ -119,7 +112,8 @@ static uint16_t fuji_calc_checksum(const void *ptr, uint16_t len, uint16_t seed)
 static uint8_t fuji_packet_call(AtariSIODirection direction, fujibus_packet *packet_ptr,
                                 void *pbuf, uint16_t plen)
 {
-  uint8_t saved_slot, my_slot;
+  uint8_t slot_ram, slot_io;
+  uint16_t slots;
   uint8_t ck1, ck2;
   uint16_t rlen;
   bool success = false;
@@ -131,21 +125,28 @@ static uint8_t fuji_packet_call(AtariSIODirection direction, fujibus_packet *pac
   if (direction == SIO_DIRECTION_WRITE)
     packet_ptr->header.length += plen;
 
+  // Checksum covers the whole header, so it has to read as zero while
+  // being calculated
+  packet_ptr->header.checksum = 0;
+
   // Data is spread across two buffers: packet_ptr and pbuf
   ck1 = fuji_calc_checksum(packet_ptr, aux_len + sizeof(packet_ptr->header), 0);
   if (direction == SIO_DIRECTION_WRITE)
     ck1 = fuji_calc_checksum(pbuf, plen, ck1);
   packet_ptr->header.checksum = ck1;
 
-  // Page in memory mapped IO
-  my_slot = msx_get_page_slot(1);
-  saved_slot = msx_get_page_slot(2);
-  msx_set_page_slot(2, my_slot);
+  // Page in memory mapped IO. pbuf belongs to the caller and may itself be
+  // in page 2, so the buffer routines are handed both slot register values
+  // and swap back to RAM around each access to it.
+  slot_ram = inp(0xA8);
+  slot_io = msx_page2_to_rom(slot_ram);
+  slots = PORT_SLOTS(slot_ram, slot_io);
+  outp(0xA8, slot_io);
 
   port_putc(SLIP_END);
-  port_putbuf_slip(packet_ptr, aux_len + sizeof(packet_ptr->header));
+  port_putbuf_slip(packet_ptr, aux_len + sizeof(packet_ptr->header), slots);
   if (direction == SIO_DIRECTION_WRITE)
-    port_putbuf_slip(pbuf, plen);
+    port_putbuf_slip(pbuf, plen, slots);
   port_putc(SLIP_END);
 
   if (direction != SIO_DIRECTION_READ) {
@@ -153,11 +154,11 @@ static uint8_t fuji_packet_call(AtariSIODirection direction, fujibus_packet *pac
     plen = 0;
   }
   rlen = port_getbuf_slip_dual(packet_ptr, sizeof(packet_ptr->header),
-                               pbuf, plen, TIMEOUT_SLOW);
+                               pbuf, plen, TIMEOUT_SLOW, slots);
   if (rlen < sizeof(fujibus_header) || rlen != packet_ptr->header.length) {
 #ifdef DEBUG
     printf("Reply length incorrect: %d %d\n", rlen, packet_ptr->header.length);
-    hexdump((uint8_t *) &fb_packet, sizeof(fujibus_header));
+    hexdump((uint8_t *) packet_ptr, sizeof(fujibus_header));
 #endif /* DEBUG */
     success = false;
     goto done;
@@ -165,7 +166,7 @@ static uint8_t fuji_packet_call(AtariSIODirection direction, fujibus_packet *pac
 #ifdef DEBUG
   if (rlen - sizeof(fujibus_header) != plen) {
     printf("Expected length incorrect: %d %d\n", rlen - sizeof(fujibus_header), plen);
-    hexdump((uint8_t *) params, sizeof(*params));
+    hexdump((uint8_t *) packet_ptr, sizeof(fujibus_header));
   }
 #endif /* DEBUG */
 
@@ -189,8 +190,8 @@ static uint8_t fuji_packet_call(AtariSIODirection direction, fujibus_packet *pac
 
   if (packet_ptr->header.device != pdev) {
 #ifdef DEBUG
-    printf("Incorrect device: R:0x%02x E:0x%02x\n", fb_packet.header.device, pdev);
-    hexdump((uint8_t *) &fb_packet, sizeof(fb_packet.header));
+    printf("Incorrect device: R:0x%02x E:0x%02x\n", packet_ptr->header.device, pdev);
+    hexdump((uint8_t *) packet_ptr, sizeof(packet_ptr->header));
 #endif /* DEBUG */
     success = false;
     goto done;
@@ -198,7 +199,7 @@ static uint8_t fuji_packet_call(AtariSIODirection direction, fujibus_packet *pac
 
   if (packet_ptr->header.command != PACKET_ACK) {
 #ifdef DEBUG
-    printf("Not ACK: 0x%02x\n", fb_packet.header.command);
+    printf("Not ACK: 0x%02x\n", packet_ptr->header.command);
 #endif /* DEBUG */
     success = false;
     goto done;
@@ -210,7 +211,7 @@ static uint8_t fuji_packet_call(AtariSIODirection direction, fujibus_packet *pac
 
  done:
   // Restore whatever was in page 2
-  msx_set_page_slot(2, saved_slot);
+  outp(0xA8, slot_ram);
   return success;
 }
 
@@ -221,7 +222,9 @@ static uint8_t fuji_unapi_call(AtariSIODirection direction, FujiNetParams *param
   fujibus_packet fb_packet;
 
 
+#ifdef DEBUG
   printf("UNAPI FUJINET BUS CALL 0x%02x PARAMS 0x%04x\n", direction, (uint16_t) params);
+#endif /* DEBUG */
 
   fb_packet.header.device = params->device;
   fb_packet.header.command = params->command;

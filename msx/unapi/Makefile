@@ -52,6 +52,6 @@ include ../mekkogx/toplevel-rules.mk
 # or
 #   apple2/disk: apple2/custom-step1 apple2/custom-step2
 
-MSXROM_FLAGS = +msx -subtype=callext
+MSXROM_FLAGS = +msx -subtype=rom -pragma-define:CRT_MSX_CUSTOM_HEADER=1
 MSX_EXTRA_DEPS = src/header/msx_rom_header.asm
 LDFLAGS_EXTRA_MSXROM = -Ca-Isrc/header -create-app

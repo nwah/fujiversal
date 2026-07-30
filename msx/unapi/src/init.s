@@ -2,6 +2,7 @@
 ;    Based on unapi-rom.asm by Konamiman, 5-2019 (MIT License)
 
 	INCLUDE	"const.inc"
+	INCLUDE	"disk.inc"
 	PUBLIC	INIT
 
 INIT:
@@ -65,7 +66,39 @@ OK_INIEXTB:
 
 ROM_INIT:
 
-	;TODO: extend (or replace) with other initialization code as needed by your implementation
+	;--- Reserve the disk driver work area just below HIMEM.
+	;    It has to be in page 3: a FujiNet transfer pages this ROM over
+	;    page 2, and the sector buffer has to stay reachable while it is.
+	;    BASIC works out its own memory from HIMEM once the slot scan is
+	;    over, so lowering it here keeps the area to ourselves.
+
+	ld	hl,(HIMEM)
+	ld	de,-(DISK_WORK_SIZE + 1)
+	add	hl,de
+	ld	(HIMEM),hl
+	inc	hl		; first byte we own
+
+	;--- Record it in our SLTWRK entry, just past the saved EXTBIO hook,
+	;    which is how disk_get_work() finds it later.
+
+	push	hl
+	call	GETSLT
+	call	GETWRK
+	ld	de,DISK_WORK_SLOT
+	add	hl,de
+	pop	de
+	ld	(hl),e
+	inc	hl
+	ld	(hl),d
+
+	;--- Mark the area as not yet cleared. We must not touch a byte of it
+	;    here: during the slot scan the boot stack is still sitting just
+	;    below HIMEM, which is precisely the memory we have taken. BASIC
+	;    moves its stack below the new HIMEM once the scan is over, so
+	;    disk_get_work() does the clearing on the first call instead.
+
+	inc	hl
+	ld	(hl),0
 
 	;--- Show informative message
 

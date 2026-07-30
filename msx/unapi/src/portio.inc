@@ -6,6 +6,12 @@
 
 	extern	timeout_init, timeout_check, timeout_cleanup
 
+	; Primary slot select register. The IO window below lives in page 2, so
+	; reaching it means paging this ROM's slot over whatever RAM is there.
+	; Routines that touch a caller supplied buffer hand page 2 back for the
+	; duration of each access, which is what lets a buffer live in page 2.
+	SLOT_PORT	EQU	0xA8
+
 	IO_OFFSET	EQU	(0x8000 + 0x3FFC)
 	IO_GETC		EQU	(IO_OFFSET + 0)
 	IO_STATUS	EQU	(IO_OFFSET + 1)
