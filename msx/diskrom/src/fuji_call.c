@@ -39,10 +39,16 @@ static void hexdump(uint8_t *buffer, int count)
 }
 #endif /* HEXDUMP */
 
-#define milliseconds_to_jiffy(millis) ((millis) / (VDP_IS_PAL ? 20 : 1000 / 60))
+/* The JIFFY counter the timeout routines read ticks once per video frame:
+   60 times a second on an NTSC machine, 50 on a PAL one. These are worked out
+   for 60Hz, so on a PAL machine every timeout runs a fifth longer, which for
+   waiting on a bus reply is no difference worth a runtime division. */
+#define JIFFIES_PER_SECOND      60
+#define milliseconds_to_jiffy(millis) ((millis) * JIFFIES_PER_SECOND / 1000)
+#define seconds_to_jiffy(secs)  ((secs) * JIFFIES_PER_SECOND)
 
 #define TIMEOUT         milliseconds_to_jiffy(100)
-#define TIMEOUT_SLOW	milliseconds_to_jiffy(15 * 1000)
+#define TIMEOUT_SLOW	seconds_to_jiffy(15)
 
 #define false 0
 #define true 1
@@ -62,18 +68,6 @@ enum {
 static const uint8_t fuji_field_numbytes_table[] = {0, 1, 2, 3, 4, 2, 4, 4};
 #define fuji_field_numbytes(descr) fuji_field_numbytes_table[descr]
 
-/* The memory mapped IO window lives in page 2, so reaching it means paging
-   this ROM's slot over whatever RAM is there. Given the current primary slot
-   register this returns the same value with page 2 pointed at the slot page 1
-   already holds, which is us: we are executing out of it. */
-static uint8_t msx_page2_to_rom(uint8_t slots)
-{
-  uint8_t my_slot = (slots >> 2) & 0x03;    /* page 1 = this ROM */
-
-
-  return (slots & 0xCF) | (my_slot << 4);   /* page 2 = the same slot */
-}
-
 static uint16_t fuji_calc_checksum(const void *ptr, uint16_t len, uint16_t seed)
 {
   uint16_t idx, chk;
@@ -85,11 +79,10 @@ static uint16_t fuji_calc_checksum(const void *ptr, uint16_t len, uint16_t seed)
   return chk;
 }
 
-uint8_t fuji_packet_call(AtariSIODirection direction, fujibus_packet *packet_ptr,
+static uint8_t fuji_packet_call(AtariSIODirection direction,
+                                fujibus_packet *packet_ptr,
                                 void *pbuf, uint16_t plen)
 {
-  uint8_t slot_ram, slot_io;
-  uint16_t slots;
   uint8_t ck1, ck2;
   uint16_t rlen;
   bool success = false;
@@ -111,18 +104,14 @@ uint8_t fuji_packet_call(AtariSIODirection direction, fujibus_packet *packet_ptr
     ck1 = fuji_calc_checksum(pbuf, plen, ck1);
   packet_ptr->header.checksum = ck1;
 
-  // Page in memory mapped IO. pbuf belongs to the caller and may itself be
-  // in page 2, so the buffer routines are handed both slot register values
-  // and swap back to RAM around each access to it.
-  slot_ram = inp(0xA8);
-  slot_io = msx_page2_to_rom(slot_ram);
-  slots = PORT_SLOTS(slot_ram, slot_io);
-  outp(0xA8, slot_io);
-
+  // The IO window is simply there: this code is in page 2 and cannot be
+  // running unless page 2 holds the cartridge. pbuf is the caller's, and the
+  // UNAPI specification forbids it from being in page 1 or page 2, so it is
+  // visible throughout.
   port_putc(SLIP_END);
-  port_putbuf_slip(packet_ptr, aux_len + sizeof(packet_ptr->header), slots);
+  port_putbuf_slip(packet_ptr, aux_len + sizeof(packet_ptr->header));
   if (direction == SIO_DIRECTION_WRITE)
-    port_putbuf_slip(pbuf, plen, slots);
+    port_putbuf_slip(pbuf, plen);
   port_putc(SLIP_END);
 
   if (direction != SIO_DIRECTION_READ) {
@@ -130,7 +119,7 @@ uint8_t fuji_packet_call(AtariSIODirection direction, fujibus_packet *packet_ptr
     plen = 0;
   }
   rlen = port_getbuf_slip_dual(packet_ptr, sizeof(packet_ptr->header),
-                               pbuf, plen, TIMEOUT_SLOW, slots);
+                               pbuf, plen, TIMEOUT_SLOW);
   if (rlen < sizeof(fujibus_header) || rlen != packet_ptr->header.length) {
 #ifdef DEBUG
     printf("Reply length incorrect: %d %d\n", rlen, packet_ptr->header.length);
@@ -186,11 +175,41 @@ uint8_t fuji_packet_call(AtariSIODirection direction, fujibus_packet *packet_ptr
   success = true;
 
  done:
-  // Restore whatever was in page 2
-  outp(0xA8, slot_ram);
   return success;
 }
 
-/* fuji_unapi_call() and fujiF5_read/write() lived here: they unpacked a
-   FujiNetParams into the packet above. The driver builds the packet itself
-   now, so the wrapper is gone. Both are still in the UNAPI ROM. */
+/*
+ * The two UNAPI routines themselves: unpack a FujiNetParams into a packet and
+ * make the call. FN_TABLE in const.s reaches these, and so does the disk
+ * driver in page 1 -- through the UNAPI entry point, like anyone else.
+ *
+ * The packet is a local, so it lives on the caller's stack. That is safe for
+ * the same reason the call works at all: a caller whose stack were in page 2
+ * would lose its own return address the moment this ROM was paged in.
+ */
+static uint8_t fuji_unapi_call(AtariSIODirection direction, FujiNetParams *params)
+{
+  uint8_t idx, numbytes;
+  fujibus_packet fb_packet;
+
+
+  fb_packet.header.device = params->device;
+  fb_packet.header.command = params->command;
+  fb_packet.header.fields = params->aux_descr;
+
+  numbytes = fuji_field_numbytes(params->aux_descr);
+  for (idx = 0; idx < numbytes; idx++)
+    fb_packet.data[idx] = params->aux[idx];
+
+  return fuji_packet_call(direction, &fb_packet, params->buffer, params->length);
+}
+
+uint8_t fujiF5_write(FujiNetParams *params) __z88dk_fastcall
+{
+  return fuji_unapi_call(SIO_DIRECTION_WRITE, params);
+}
+
+uint8_t fujiF5_read(FujiNetParams *params) __z88dk_fastcall
+{
+  return fuji_unapi_call(SIO_DIRECTION_READ, params);
+}

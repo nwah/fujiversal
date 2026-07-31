@@ -1,16 +1,15 @@
-	extern	_port_getc, _port_getc_timeout, _port_discard_until
-	extern	_port_getbuf, _port_get_until
-	extern	_port_putc, _port_putbuf
-
-	extern	getbuf_done
+	extern	_port_getc, _port_getc_timeout
+	extern	_port_putc
 
 	extern	timeout_init, timeout_check, timeout_cleanup
 
-	; Primary slot select register. The IO window below lives in page 2, so
-	; reaching it means paging this ROM's slot over whatever RAM is there.
-	; Routines that touch a caller supplied buffer hand page 2 back for the
-	; duration of each access, which is what lets a buffer live in page 2.
-	SLOT_PORT	EQU	0xA8
+	; The IO window is the last four bytes of page 2. Everything that
+	; touches it lives in page 2 as well, and page 2 code only ever runs
+	; with this ROM paged in -- that is what the inter-slot call to the
+	; UNAPI entry point arranges -- so the window is simply there and no
+	; routine here touches the slot register. The UNAPI specification
+	; forbids a caller's buffer in page 1 or page 2 for the same reason:
+	; both pages belong to the implementation for the length of a call.
 
 	IO_OFFSET	EQU	(0x8000 + 0x3FFC)
 	IO_GETC		EQU	(IO_OFFSET + 0)

@@ -1,3 +1,5 @@
+	INCLUDE	"page2.inc"
+
 	public	timeout_init, timeout_check, timeout_cleanup
 
 ; ============================================================

@@ -2,9 +2,14 @@
 #define DISK_H
 
 #include "fujinet.h"
+#include "fuji_call.h"
 #include <stdint.h>
 
 #define SECTOR_SIZE     512
+
+/* Drives this driver hands out, one per FujiNet disk device slot. Keep in
+   step with FN_MAX_DEV in driver.asm, which is what the kernel is told. */
+#define FN_DRIVES       2
 
 /* Error codes returned in A alongside a set carry flag. Note that zero is
    a real error and not a success value. */
@@ -57,17 +62,26 @@ typedef struct {
    driver.asm says how much, and GETWRK hands back the address -- so it lands
    wherever the kernel keeps its own work areas, in page 3.
 
-   There is deliberately no sector buffer here. Transfers go straight to the
-   caller's memory, and the SLIP routines hand page 2 back for the instant it
-   takes to touch it; DSKFMT builds its sectors in the work area the kernel
-   passes in. Keep MYSIZE in driver.asm in step with this. */
+   Page 3 is the point. A UNAPI call pages this cartridge into page 2 and runs
+   with page 1 already there, so neither a parameter block nor a buffer may
+   live in either; both of them live here instead. Keep MYSIZE in driver.asm
+   in step with this -- disk.c has a compile time check. */
 #define MOUNT_STAMP_BYTES 4     /* low half of the FujiNet 64 bit mount time */
+#define EXTBIO_HOOK_BYTES 5
 
 typedef struct {
+  /* The EXTBIO hook this ROM displaced at boot. First in the struct because
+     unapi_init.s finds it at the front of the work area. */
+  uint8_t old_extbio[EXTBIO_HOOK_BYTES];
   /* Mount time seen at the last media check, as raw bytes: comparing these
      as uint32_t would drag the 32 bit runtime helpers into a ROM that has no
      room for them. */
-  uint8_t mount_time[FN_MAX_DEV][MOUNT_STAMP_BYTES];
+  uint8_t mount_time[FN_DRIVES][MOUNT_STAMP_BYTES];
+  /* The parameter block every FujiNet call goes out with */
+  FujiNetParams params;
+  /* Sectors land here when the address the kernel gave us is one the FujiNet
+     call cannot reach, and short replies that would otherwise need a local. */
+  uint8_t buffer[SECTOR_SIZE];
 } DiskWork;
 
 /* Implemented in disk_entry.s */

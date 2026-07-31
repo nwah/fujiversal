@@ -33,12 +33,10 @@ typedef struct {
   uint8_t data[4]; /* max 4 aux bytes */
 } fujibus_packet;
 
-/* The bus call itself. The driver fills in device, command, fields and the
-   aux bytes; length and checksum are worked out here. There is no
-   FujiNetParams wrapper in this ROM -- the extra layer cost bytes this 16K
-   image does not have. */
-extern uint8_t fuji_packet_call(AtariSIODirection direction,
-                                fujibus_packet *packet, void *pbuf,
-                                uint16_t plen);
+/* Only the types are declared here. The routines that use them are UNAPI
+   routines 2 and 3, they live in page 2, and FN_TABLE in const.s is the only
+   thing that reaches them -- no C in page 1 calls into page 2 directly. That
+   also keeps this header free of the calling convention keywords, which are
+   spelled differently by the two compilers this ROM is built with. */
 
 #endif /* FUJI_CALL_H */

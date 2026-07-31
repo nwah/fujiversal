@@ -1,3 +1,4 @@
+	INCLUDE	"page2.inc"
 	include	"portio.inc"
 	public	_port_getbuf_slip_dual
 
@@ -24,16 +25,13 @@ ENDM
 ;-----------------------------------------------------------------------------
 ; uint16_t port_getbuf_slip_dual(void *hdr_buf,  uint16_t hdr_len,
 ;                                void *data_buf, uint16_t data_len,
-;                                uint16_t timeout, uint16_t slots)
+;                                uint16_t timeout)
 ;
 ; Read and decode a SLIP-framed packet into two buffers.
-; (__callee__ calling convention -- callee cleans the stack)
+; (__z88dk_callee convention -- callee cleans the stack)
 ;
-; slots carries the two values to write to the primary slot register: the
-; low byte selects the caller's RAM in page 2, the high byte selects this
-; ROM's slot so the IO window is reachable. Page 2 is the ROM's on entry and
-; on exit; each stored byte hands it back to RAM just long enough to write,
-; which is what allows a destination buffer in page 2.
+; Both buffers are written directly. Neither can be in page 2, because this
+; ROM is paged there for the whole call, and the UNAPI specification says so.
 ;
 ; Operation:
 ; - First hdr_len bytes go to hdr_buf
@@ -50,14 +48,13 @@ ENDM
 ;   First hdr_len decoded bytes -> hdr_buf
 ;   Remaining decoded bytes     -> data_buf (up to data_len bytes)
 ;
-; Stack on entry (left-to-right push, rightmost param nearest SP):
+; Stack on entry (right-to-left push, leftmost param nearest SP):
 ;   (SP+0)  = return address
-;   (SP+2)  = slots    (rightmost, pushed last)
-;   (SP+4)  = timeout
-;   (SP+6)  = data_len
-;   (SP+8)  = data_buf
-;   (SP+10) = hdr_len
-;   (SP+12) = hdr_buf          (leftmost, pushed first)
+;   (SP+2)  = hdr_buf          (leftmost, pushed last)
+;   (SP+4)  = hdr_len
+;   (SP+6)  = data_buf
+;   (SP+8)  = data_len
+;   (SP+10) = timeout          (rightmost, pushed first)
 ;
 ; Convert ms to jiffies before calling:
 ;   PAL  (50 Hz): jiffies = ms / 20
@@ -67,18 +64,17 @@ ENDM
 ;   HL = total decoded bytes written (header + data)
 ;-----------------------------------------------------------------------------
 
-	ARG_BYTE_LEN	equ	12	; 6 words
+	ARG_BYTE_LEN	equ	10	; 5 words
 
 	; How much may be thrown away before a frame starts, in units of 256
 	; bytes. Comfortably more than one packet, so a late reply still syncs.
 	SLIPD_JUNK_MAX	equ	8
 
-	SLIPD_PARAM_SLOTS	equ	6
-	SLIPD_PARAM_TIMEOUT	equ	8
-	SLIPD_PARAM_DATA_LEN	equ	10
-	SLIPD_PARAM_DATA_BUF	equ	12
-	SLIPD_PARAM_HDR_LEN	equ	14
-	SLIPD_PARAM_HDR_BUF	equ	16
+	SLIPD_PARAM_HDR_BUF	equ	6
+	SLIPD_PARAM_HDR_LEN	equ	8
+	SLIPD_PARAM_DATA_BUF	equ	10
+	SLIPD_PARAM_DATA_LEN	equ	12
+	SLIPD_PARAM_TIMEOUT	equ	14
 
 _port_getbuf_slip_dual:
 	push	ix			; Callee-save IX
@@ -88,11 +84,13 @@ _port_getbuf_slip_dual:
 	;   (SP+0)  = saved IY
 	;   (SP+2)  = saved IX
 	;   (SP+4)  = Return Address
-	;   (SP+6)  = timeout
-	;   (SP+8)  = data_len
+	;   (SP+6)  = hdr_buf
+	;   (SP+8)  = hdr_len
 	;   (SP+10) = data_buf
-	;   (SP+12) = hdr_len
-	;   (SP+14) = hdr_buf
+	;   (SP+12) = data_len
+	;   (SP+14) = timeout
+	;
+	; which is where the SLIPD_PARAM_ offsets above come from.
 
 	ld	ix, 0
 	add	ix, sp	       		; IX is now our stable base for parameters
@@ -156,17 +154,8 @@ slipd_decode_loop:
 	jr	z, slipd_handle_escape
 
 slipd_store_byte:
-	; Write byte to current buffer (DE). Page 2 currently holds the IO
-	; window, so give it back to RAM for the store and take it again
-	; afterwards. HL is reloaded with the timeout before every read, so L
-	; is free to hold the byte across the switch.
-	ld	l, a
-	ld	a, (ix + SLIPD_PARAM_SLOTS)		; page 2 = caller's RAM
-	out	(SLOT_PORT), a
-	ld	a, l
+	; Write byte to current buffer (DE)
 	ld	(de), a
-	ld	a, (ix + SLIPD_PARAM_SLOTS + 1)		; page 2 = IO window
-	out	(SLOT_PORT), a
 	inc	de
 	dec	bc
 	inc	iy

@@ -13,14 +13,17 @@
 #include "disk.h"
 #include "fujinet.h"
 #include "fuji_call.h"
+#include "unapi_call.h"
 #include <string.h>
 
 /* Fails to compile if DiskWork outgrows the MYSIZE the kernel is told to
    allocate. Keep the two in step; MYSIZE lives in driver.asm. */
-#define MYSIZE  32
+#define MYSIZE  536
 typedef char disk_work_size_check[sizeof(DiskWork) <= MYSIZE ? 1 : -1];
 
-/* Where the BPB starts inside a FAT boot sector, and the offsets within it */
+/* Where the BPB starts inside a FAT boot sector, and the offsets within it.
+   Nothing reads these any more -- DSKFMT copies a ready made block in -- but
+   they are what names the columns of the bpb rows in formats[] below. */
 #define BPB_OFFSET      0x0b
 #define BPB_SECSIZE     0       /* word: bytes per sector */
 #define BPB_CLUSSIZE    2       /* byte: sectors per cluster */
@@ -50,9 +53,6 @@ typedef char disk_work_size_check[sizeof(DiskWork) <= MYSIZE ? 1 : -1];
 #define DPB_FATSIZ      16      /* byte: sectors per FAT */
 #define DPB_FIRDIR      17      /* word: first root directory sector */
 
-#define DIR_ENTRY_SIZE  32
-#define DIR_PER_SECTOR  (SECTOR_SIZE / DIR_ENTRY_SIZE)
-
 /* Geometry of the standard MSX formats, indexed by media descriptor - 0xF8.
    All of them reserve one boot sector and carry two FATs. */
 /* The 19 byte Drive Parameter Block the kernel wants, minus its leading drive
@@ -78,53 +78,116 @@ static const uint8_t dpb_table[][DPB_BYTES] = {
   /* FF */ { 0xff, 0x00, 0x02, 0x0f, 0x04, 0x01, 0x02, 0x01, 0x00, 0x02, 0x70, 0x0a, 0x00, 0x3c, 0x01, 0x01, 0x03, 0x00 },
 };
 
-/* Offsets within a dpb_table row */
+/* Offsets within a dpb_table row, which is a DPB without its drive number.
+   Like the BPB offsets above these name the columns rather than being read:
+   GETDPB copies a whole row into the block the kernel hands it. */
 #define ROW_MEDIA       0
+#define ROW_CLUSMASK    5
 #define ROW_MAXENT      10
 #define ROW_FIRREC      11
 #define ROW_MAXCLUS     13
 #define ROW_FATSIZ      15
 
+/* Sectors on each of those formats, in the same order. Each one is what the
+   row above works out to: first data sector + (highest cluster - 1) sectors
+   per cluster. Held as a table because the multiply to derive it costs more
+   than the sixteen bytes it would save. */
+static const uint16_t media_sectors[] = {
+  /* F8 */  720,   /* F9 */ 1440,  /* FA */  640,  /* FB */ 1280,
+  /* FC */  360,   /* FD */  720,  /* FE */  320,  /* FF */  640,
+};
+
+/* What CHOICE offers and DSKFMT then formats: the two standard MSX shapes.
+   Everything either of them needs is here, ready to copy into a boot sector,
+   which keeps DSKFMT down to moving bytes about. Working the same numbers out
+   of dpb_table would cost more code than the forty bytes this table is. */
+#define FORMAT_CHOICES  2
+
+typedef struct {
+  uint8_t media;
+  uint8_t fat_size;             /* sectors per FAT */
+  uint8_t first_data;           /* first sector past the FATs and the root */
+  uint8_t bpb[BPB_SIZE];        /* the block at BPB_OFFSET of a boot sector */
+} MsxFormat;
+
+static const MsxFormat formats[FORMAT_CHOICES] = {
+  /* 360K, single sided */
+  { 0xf8, 2, 12,
+    { 0x00, 0x02, 0x02, 0x01, 0x00, 0x02, 0x70, 0x00, 0xd0, 0x02,
+      0xf8, 0x02, 0x00, 0x09, 0x00, 0x01, 0x00 } },
+  /* 720K, double sided */
+  { 0xf9, 3, 14,
+    { 0x00, 0x02, 0x02, 0x01, 0x00, 0x02, 0x70, 0x00, 0xa0, 0x05,
+      0xf9, 0x03, 0x00, 0x09, 0x00, 0x02, 0x00 } },
+};
+
+static const char format_prompt[] = "1 - Single sided\r\n2 - Double sided\r\n";
+
 
 
 /*
  * FujiNet calls
+ *
+ * Every one of them leaves through the UNAPI entry point in page 2. The
+ * parameter block lives in the work area rather than on the stack because
+ * the specification says it may not be in page 1 or page 2, and the stack
+ * belongs to whoever called the kernel.
  */
 
 static uint8_t disk_call(uint8_t device, uint8_t command, uint8_t aux_descr,
                          uint16_t aux_low, void *buffer, uint16_t length,
                          uint8_t read)
 {
-  fujibus_packet packet;
+  FujiNetParams *params = &disk_get_work()->params;
 
 
-  packet.header.device = device;
-  packet.header.command = command;
-  packet.header.fields = aux_descr;
-  packet.data[0] = (uint8_t) aux_low;
-  packet.data[1] = (uint8_t) (aux_low >> 8);
-  packet.data[2] = 0;
-  packet.data[3] = 0;
+  params->device = device;
+  params->command = command;
+  params->aux_descr = aux_descr;
+  params->aux[0] = (uint8_t) aux_low;
+  params->aux[1] = (uint8_t) (aux_low >> 8);
+  params->aux[2] = 0;
+  params->aux[3] = 0;
+  params->buffer = buffer;
+  params->length = length;
 
-  return fuji_packet_call(read ? SIO_DIRECTION_READ : SIO_DIRECTION_WRITE,
-                          &packet, buffer, length);
+  return read ? unapi_fuji_read(params) : unapi_fuji_write(params);
 }
 
-/* Sectors move straight between the FujiNet and the caller's memory. A
-   transfer pages this ROM over page 2, so a buffer that lives there would
-   normally be hidden for the duration; the SLIP routines hand page 2 back
-   around each access to it, which is what makes this safe. */
+/* An address the FujiNet call cannot reach, because this cartridge is sitting
+   over it while the call runs: page 1 is ours already and page 2 becomes ours
+   for the length of the call. Sectors bound for one get bounced through the
+   work area, which is in page 3. */
+#define UNREACHABLE(ptr)        (((uint16_t) (ptr)) >= 0x4000 && \
+                                 ((uint16_t) (ptr)) < 0xC000)
 
-static uint8_t disk_read_sector(uint8_t drive, uint16_t sector, void *buffer)
+static uint8_t disk_read_sector(uint8_t drive, uint16_t sector, uint8_t *buffer)
 {
-  return disk_call(FUJI_DEVICEID_DISK + drive, FUJICMD_READ, FUJI_FIELD_C1234,
-                   sector, buffer, SECTOR_SIZE, 1);
+  DiskWork *work = disk_get_work();
+
+
+  if (!UNREACHABLE(buffer))
+    return disk_call(FUJI_DEVICEID_DISK + drive, FUJICMD_READ,
+                     FUJI_FIELD_C1234, sector, buffer, SECTOR_SIZE, 1);
+
+  if (!disk_call(FUJI_DEVICEID_DISK + drive, FUJICMD_READ, FUJI_FIELD_C1234,
+                 sector, work->buffer, SECTOR_SIZE, 1))
+    return 0;
+  memcpy(buffer, work->buffer, SECTOR_SIZE);
+  return 1;
 }
 
-static uint8_t disk_write_sector(uint8_t drive, uint16_t sector, const void *buffer)
+static uint8_t disk_write_sector(uint8_t drive, uint16_t sector, uint8_t *buffer)
 {
-  return disk_call(FUJI_DEVICEID_DISK + drive, FUJICMD_WRITE, FUJI_FIELD_C1234,
-                   sector, (void *) buffer, SECTOR_SIZE, 0);
+  DiskWork *work = disk_get_work();
+
+
+  if (UNREACHABLE(buffer)) {
+    memcpy(work->buffer, buffer, SECTOR_SIZE);
+    buffer = work->buffer;
+  }
+  return disk_call(FUJI_DEVICEID_DISK + drive, FUJICMD_WRITE,
+                   FUJI_FIELD_C1234, sector, buffer, SECTOR_SIZE, 0);
 }
 
 /*
@@ -170,8 +233,8 @@ static void disk_build_dpb(uint8_t *dpb, uint8_t media)
  * Out: Cy = 0 on success. On failure Cy = 1, A = error code and
  *      B = the number of sectors still untransferred.
  *
- * The transfer address is used as it stands, including when it points into
- * page 2, which a FujiNet transfer would otherwise have paged this ROM over.
+ * A transfer address in page 2 is the kernel's to give -- that is where the
+ * TPA runs -- so it is bounced rather than refused.
  */
 void __FASTCALL__ disk_io(MsxRegs *regs)
 {
@@ -181,14 +244,24 @@ void __FASTCALL__ disk_io(MsxRegs *regs)
   uint16_t sector = regs->de;
   uint8_t *buffer = MSX_PTR(regs->hl);
   uint8_t err = DISK_ERR_OTHER;
+  int8_t row = media_row(regs->c);
+  uint16_t limit;
 
 
-  if (drive >= FN_MAX_DEV)
+  if (drive >= FN_DRIVES)
     goto fail;
 
-  /* No bounds check on the sector number: the device rejects anything past
-     the end of the image, and the table it would take to check against does
-     not fit. */
+  /* Refuse a transfer that would run off the end of a disk of the shape the
+     kernel says this is. A media descriptor we do not recognise describes no
+     particular shape, so there is nothing to check it against. */
+  if (row >= 0) {
+    limit = media_sectors[row];
+    if (sector >= limit || (uint16_t) (limit - sector) < count) {
+      err = DISK_ERR_NOT_FOUND;
+      goto fail;
+    }
+  }
+
   while (count) {
     if (write) {
       if (!disk_write_sector(drive, sector, buffer)) {
@@ -238,12 +311,13 @@ void __FASTCALL__ disk_chg(MsxRegs *regs)
   uint8_t drive = regs->a;
   const uint8_t *stamp;
   uint8_t idx, mounted;
-  /* The reply covers every slot at once, so it is staged here rather than
-     kept in the work area: the stack gives the space back afterwards. */
-  uint8_t reply[MOUNT_TIME_REPLY_SIZE];
+  /* The reply covers every slot at once. It is staged in the work area
+     because a FujiNet call cannot write anywhere else this driver can put
+     it: the stack is the caller's and may be in page 2. */
+  uint8_t *reply = work->buffer;
 
 
-  if (drive >= FN_MAX_DEV) {
+  if (drive >= FN_DRIVES) {
     regs->a = DISK_ERR_OTHER;
     regs->f |= REG_CARRY;
     return;
@@ -298,26 +372,72 @@ void __FASTCALL__ disk_getdpb(MsxRegs *regs)
  */
 void __FASTCALL__ disk_choice(MsxRegs *regs)
 {
-  regs->hl = 0;             /* no choices: DSKFMT is not supported */
+  regs->hl = (uint16_t) format_prompt;
   return;
 }
 
 /*
- * DSKFMT (401Ch): not supported.
+ * DSKFMT (401Ch): lay a fresh filesystem on the image.
  *
- * Out: Cy = 1 and A = error code
+ * In:  A = choice, from 1, D = drive, HL = a work area, BC = its length
+ * Out: Cy = 0 on success, else Cy = 1 and A = error code
  *
- * There is no medium to lay tracks on, so this would only mean writing a
- * boot sector and blank FATs -- but the code to do it does not fit. The
- * Disk BIOS fills most of this 16K ROM and what is left has to cover the
- * FujiNet transport first. Create images on the host instead, where the
- * FujiNet can make them properly sized.
+ * There is no medium here to lay tracks on, so formatting is only writing a
+ * boot sector, two empty FATs and an empty root directory. The kernel offers
+ * a work area to build them in, but this driver has its own in page 3 and a
+ * FujiNet call cannot be handed anything else, so the kernel's is left alone.
  *
- * CHOICE reports no format choices, so the kernel should not offer this.
+ * The image itself is whatever size the FujiNet mounted; nothing here can
+ * change that. Formatting a slot holding an image of some other shape will
+ * write a filesystem that claims a size the image does not have.
  */
 void __FASTCALL__ disk_fmt(MsxRegs *regs)
 {
-  regs->a = FMT_ERR_OTHER;
+  uint8_t *sector = disk_get_work()->buffer;
+  uint8_t choice = regs->a;
+  uint8_t drive = (uint8_t) (regs->de >> 8);
+  const MsxFormat *fmt;
+  uint16_t idx;
+
+
+  if (drive >= FN_DRIVES || choice < 1 || choice > FORMAT_CHOICES) {
+    regs->a = FMT_ERR_BAD_PARAM;
+    regs->f |= REG_CARRY;
+    return;
+  }
+  fmt = &formats[choice - 1];
+
+  /* The boot sector. The jump at the front is the usual one to itself: this
+     disk holds no boot code, and everything that matters follows it. */
+  memset(sector, 0, SECTOR_SIZE);
+  sector[0] = 0xeb;
+  sector[1] = 0xfe;
+  sector[2] = 0x90;
+  memcpy(&sector[BPB_OFFSET], fmt->bpb, BPB_SIZE);
+  if (!disk_write_sector(drive, 0, sector))
+    goto fail;
+
+  /* Both FATs and the whole root directory start empty */
+  memset(sector, 0, SECTOR_SIZE);
+  for (idx = 1; idx < fmt->first_data; idx++)
+    if (!disk_write_sector(drive, idx, sector))
+      goto fail;
+
+  /* except that each FAT opens with the two reserved entries */
+  sector[0] = fmt->media;
+  sector[1] = 0xff;
+  sector[2] = 0xff;
+  if (!disk_write_sector(drive, 1, sector))
+    goto fail;
+  if (!disk_write_sector(drive, 1 + fmt->fat_size, sector))
+    goto fail;
+
+  regs->f &= ~REG_CARRY;
+  return;
+
+ fail:
+  /* A slot mounted read only refuses every one of these writes */
+  regs->a = DISK_ERR_WRITE_PROTECT;
   regs->f |= REG_CARRY;
   return;
 }

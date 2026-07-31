@@ -14,10 +14,10 @@
 
 	EXTERN	UNAPI_ENTRY
 
-;--- Function numbers, matching the order of FN_TABLE in const.s
+;--- Function numbers from the FujiNet Firmware UNAPI specification 1.0
 
-UNAPI_FN_WRITE:	equ	1
-UNAPI_FN_READ:	equ	2
+UNAPI_FN_WRITE:	equ	2
+UNAPI_FN_READ:	equ	3
 
 ;--- Send a command, with an optional payload to the FujiNet
 ;    Input:  HL = FujiNetParams *

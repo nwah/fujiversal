@@ -18,20 +18,34 @@
 
 	EXTERN	_disk_io, _disk_chg, _disk_getdpb, _disk_choice, _disk_fmt
 
+;--- Announcing the UNAPI implementation in page 2 is part of coming up, see
+;    unapi_init.s.
+
+	EXTERN	UNAPI_INSTALL
+
 ;--- Kernel routines this driver uses. GETWRK hands back the work area the
-;    kernel allocated for us, see MYSIZE.
+;    kernel allocated for us, see MYSIZE. GETSLT is exported for the page 1
+;    UNAPI code, which needs to know which slot this cartridge is in; it is
+;    the kernel's own routine and reads the slot of page 1, which is us.
 
 	EXTERN	GETWRK
+	PUBLIC	GETSLT
 
-;--- One drive per FujiNet disk device slot. The kernel refuses more than 8.
+;--- One drive per FujiNet disk device slot. The kernel refuses more than 8,
+;    and rather fewer than that in practice -- see PLAN.md. Keep in step with
+;    FN_DRIVES in disk.h.
 
 FN_MAX_DEV:	equ	2
 
-;--- Work area the kernel allocates on our behalf and remembers in SLTWRK:
-;    one 32 bit mount time per drive, which is how DSKCHG spots a disk being
-;    swapped underneath us. Keep in sync with DiskWork in disk.h.
+;--- Work area the kernel allocates on our behalf and remembers in SLTWRK.
+;    It holds the displaced EXTBIO hook, one 32 bit mount time per drive (how
+;    DSKCHG spots a disk being swapped underneath us), the parameter block
+;    every UNAPI call goes out with, and a sector sized bounce buffer. The
+;    last two are there because the kernel's own memory is in page 3 and a
+;    UNAPI call may not be handed anything in page 1 or page 2. Keep in sync
+;    with DiskWork in disk.h, which has a compile time check on this number.
 
-MYSIZE:		equ	4 * FN_MAX_DEV
+MYSIZE:		equ	536
 
 ;--- Largest sector this driver will ever ask the kernel to buffer
 
@@ -62,16 +76,21 @@ DRIVES:
 ;    The kernel has just allocated MYSIZE bytes for us. Clear them so every
 ;    drive starts out with no mount time on record, which makes the first
 ;    DSKCHG on each drive report a change and build a fresh DPB.
+;
+;    This is also the driver's one chance to run code at boot with the work
+;    area in hand, so the UNAPI half of the ROM announces itself here.
 
 INIENV:
 	call	GETWRK		; HL = our work area
+	push	hl
 	ld	d,h
 	ld	e,l
 	inc	de
 	ld	(hl),0
 	ld	bc,MYSIZE-1
 	ldir
-	ret
+	pop	hl
+	jp	UNAPI_INSTALL
 
 
 ;--- MTOFF: stop the drive motors

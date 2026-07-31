@@ -1,8 +1,9 @@
 ;--- FujiNet MSX UNAPI implementation
 ;    Based on unapi-rom.asm by Konamiman, 5-2019 (MIT License)
 
+	INCLUDE	"page2.inc"
 	PUBLIC	UNAPI_ENTRY
-	INCLUDE	"const.inc"
+	INCLUDE	"unapi.inc"
 
 UNAPI_ENTRY:
 	push	hl

@@ -1,9 +1,10 @@
 ;--- FujiNet MSX UNAPI implementation
 ;    Based on unapi-rom.asm by Konamiman, 5-2019 (MIT License)
 
-	PUBLIC	INITMSG, UNAPI_ID, APIINFO, FN_TABLE, MAX_FN
-	INCLUDE	"const.inc"
-	INCLUDE "fuji_call.inc"
+	INCLUDE	"page2.inc"
+	PUBLIC	UNAPI_ID, APIINFO, FN_TABLE, MAX_FN
+	INCLUDE	"unapi.inc"
+	INCLUDE	"fuji_call.inc"
 
 	;--- Specification identifier (up to 15 chars)
 
@@ -15,13 +16,6 @@ UNAPI_ID:
 APIINFO:
 	db	"ROM implementation of FUJINET UNAPI",0
 
-	;--- Other data
-
-INITMSG:
-	db	13,10,"FujiNet UNAPI + Disk ROM 1.0B",13,10
-	db	13,10
-	db	0
-
 ;--- Standard routines addresses table
 ;    Numbering follows the FujiNet Firmware UNAPI specification 1.0: 0 is the
 ;    mandatory info routine, 2 is write and 3 is read. The specification
@@ -30,9 +24,14 @@ INITMSG:
 FN_TABLE:
 	dw	FN_INFO          ; 0  FN_GETINFO
 	dw	FN_UNDEFINED     ; 1  unassigned by the specification
-	dw	_fujiF5_write    ; 2  FN_CALL_WRITE
-	dw	_fujiF5_read     ; 3  FN_CALL_READ
-MAX_FN:	equ	($ - FN_TABLE) / 2 - 1
+	dw	FN_WRITE         ; 2  FN_CALL_WRITE
+	dw	FN_READ          ; 3  FN_CALL_READ
+
+;--- The highest routine number in the table. Written out rather than
+;    measured from $: this section is orged into a bank, and the address
+;    arithmetic that would give does not survive that.
+
+MAX_FN:	equ	3
 
 
 ;--- Mandatory routine 0: return API information
@@ -56,3 +55,24 @@ FN_INFO:
 FN_UNDEFINED:
 	ret
 
+;--- Routines 2 and 3: hand HL straight to the transport, and give it a
+;    running clock to wait on.
+;
+;    Everything reaches this entry point through an inter-slot call, and the
+;    MSX inter-slot call routines disable interrupts. The transport times its
+;    waits off JIFFY, which the frame interrupt is the only thing that
+;    advances, so with interrupts left off a device that never answers is
+;    waited on for ever. Turn them on for the length of the call and hand the
+;    machine back the way it arrived.
+
+FN_WRITE:
+	ei
+	call	_fujiF5_write
+	di
+	ret
+
+FN_READ:
+	ei
+	call	_fujiF5_read
+	di
+	ret

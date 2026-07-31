@@ -1,3 +1,4 @@
+	INCLUDE	"page2.inc"
 	include	"portio.inc"
 
 ;; extern int __FASTCALL__ port_getc();

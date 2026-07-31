@@ -1,28 +1,25 @@
+	INCLUDE	"page2.inc"
 	INCLUDE	"portio.inc"
 	PUBLIC	_port_putbuf_slip
 
 ;-----------------------------------------------------------------------------
-; uint16_t port_putbuf_slip(const void *buf, uint16_t len, uint16_t slots)
-; Encode and transmit a SLIP-framed packet  (__CALLEE__ calling convention)
+; uint16_t port_putbuf_slip(const void *buf, uint16_t len)
+; Encode and transmit a SLIP-framed packet  (__z88dk_callee convention)
 ;
 ; Operation:
 ;   - 0xC0 -> sends 0xDB 0xDC
 ;   - 0xDB -> sends 0xDB 0xDD
 ;   - Other -> sends as-is
 ;
-; slots carries the two values to write to the primary slot register: the
-; low byte selects the caller's RAM in page 2, the high byte selects this
-; ROM's slot so the IO window is reachable. Page 2 is the ROM's on entry and
-; on exit; each source byte is fetched with RAM paged back in, which is what
-; allows a source buffer in page 2.
+; buf is read directly. It cannot be in page 2, because this ROM is paged
+; there for the whole call, and the UNAPI specification says so.
 ;
-; Parameters (pushed left-to-right, callee cleans stack):
+; Parameters (pushed right-to-left, callee cleans stack):
 ;
 ; Stack on entry:
 ;   (SP+0) = return address
-;   (SP+2) = slots
+;   (SP+2) = buf
 ;   (SP+4) = len
-;   (SP+6) = buf
 ;
 ; Returns:
 ;   HL = number of encoded bytes transmitted
@@ -32,29 +29,14 @@
 ;   BC = remaining bytes to encode (counts down)
 ;   DE = encoded byte count (moved to HL on return)
 ;   HL = source buffer pointer
-;   IX = parameter base
 ;-----------------------------------------------------------------------------
 
-	PUTB_PARAM_SLOTS	equ	4
-	PUTB_PARAM_LEN		equ	6
-	PUTB_PARAM_BUF		equ	8
-
-	ARG_BYTE_LEN		equ	6	; 3 words
-
 _port_putbuf_slip:
-	PUSH	IX			; Callee-save IX
-	LD	IX, 0
-	ADD	IX, SP			; IX is our stable base for parameters
+	POP	DE			; Return address
+	POP	HL			; HL = buf
+	POP	BC			; BC = len
+	PUSH	DE			; Return address back; the stack is clean
 
-	; Stack at this point:
-	;   (IX+0) = saved IX
-	;   (IX+2) = return address
-	;   (IX+4) = slots
-	;   (IX+6) = len
-	;   (IX+8) = buf
-
-	LD	BC, (IX + PUTB_PARAM_LEN)
-	LD	HL, (IX + PUTB_PARAM_BUF)
 	LD	DE, 0			; DE counts encoded bytes
 
 	; Check for zero length
@@ -63,16 +45,8 @@ _port_putbuf_slip:
 	JR	Z, slip_put_end
 
 slip_put_loop:
-	; Page 2 currently holds the IO window, so give it back to RAM long
-	; enough to fetch the source byte, then take it again to transmit.
-	LD	A, (IX + PUTB_PARAM_SLOTS)	; page 2 = caller's RAM
-	OUT	(SLOT_PORT), A
 	LD	A, (HL)			; Load byte from buffer
 	INC	HL			; Advance pointer
-	PUSH	AF
-	LD	A, (IX + PUTB_PARAM_SLOTS + 1)	; page 2 = IO window
-	OUT	(SLOT_PORT), A
-	POP	AF
 
 	CP	SLIP_END		; 0xC0?
 	JR	Z, slip_put_encode_end
@@ -88,17 +62,6 @@ slip_put_send:
 	JR	NZ, slip_put_loop
 
 slip_put_end:
-	LD	SP, IX			; Discard anything left on the stack
-	POP	IX			; Restore IX
-
-	POP	BC			; BC = return address
-
-	; Clean the arguments off the stack
-	LD	HL, ARG_BYTE_LEN
-	ADD	HL, SP
-	LD	SP, HL			; SP is now cleaned
-
-	PUSH	BC			; Put return address back
 	EX	DE, HL			; HL = encoded byte count
 	RET
 
