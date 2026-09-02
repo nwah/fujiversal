@@ -6,6 +6,25 @@ else
   ROM_IMAGE = config-msx.rom
 endif
 
+# The MSX-UNAPI cartridge, baked beside the ROM above rather than instead of
+# it: at power-on it sits in subslot 0 of an expanded slot, with that ROM in
+# subslot 1, so the BIOS installs UNAPI before anything else runs and every
+# program on the machine can reach the FujiNet through EXTBIO. See msx/unapi.
+#
+# It only goes in on boards whose .pio defines RD_PIN. Putting two images on
+# the bus at once means owning the subslot register at FFFFh, and without /RD
+# the Pico cannot tell a bus read from a write and so cannot see the write
+# that selects a subslot. Detected rather than naming boards, so this does not
+# need touching when a board gains or loses the pin.
+HAS_RD := $(shell grep -c RD_PIN boards/$(BOARD).pio)
+
+UNAPI_ROM_DIR = msx/unapi
+UNAPI_SRC = $(wildcard $(UNAPI_ROM_DIR)/src/*) \
+	    $(wildcard $(UNAPI_ROM_DIR)/src/header/*) $(UNAPI_ROM_DIR)/Makefile
+ifneq ($(HAS_RD),0)
+  UNAPI_H = $(BUILD_DIR)/unapi_rom.h
+endif
+
 BUILD_DIR = build/$(BOARD)
 BUILD_MAKE = $(BUILD_DIR)/Makefile
 FIRMWARE = fujiversal_$(BOARD).uf2
@@ -18,7 +37,7 @@ UF2_BINARY = $(BUILD_DIR)/fujiversal_$(BOARD).uf2
 
 SRC = main.cpp board_defs.h setup_sm.cpp setup_sm.h FujiBusPacket.cpp	\
       FujiBusPacket.h fujiDeviceID.h fujiCommandID.h diag_uart.cpp	\
-      diag_uart.h $(ROM_H)
+      diag_uart.h $(ROM_H) $(UNAPI_H)
 
 $(BUILD_DIR)/$(FIRMWARE): $(SRC) $(BUILD_MAKE)
 	defoogi make -C $(BUILD_DIR)
@@ -45,6 +64,16 @@ $(ROM_H): $(ROM_IMAGE) | $(BUILD_DIR)
 
 $(ROM_IMAGE): $(ROM_CFILES) $(ROM_AFILES)
 	defoogi make -C $(MSX_DIR)
+
+ifneq ($(HAS_RD),0)
+$(UNAPI_H): $(UNAPI_ROM_DIR)/r2r/msxrom/unapi.rom | $(BUILD_DIR)
+	xxd -i -n unapi_rom $< > $@
+
+# mekkogx drives this one, and asks for the assembler by the name z88dk does
+# not install it under.
+$(UNAPI_ROM_DIR)/r2r/msxrom/unapi.rom: $(UNAPI_SRC)
+	AS_DEFAULT=z88dk-z80asm defoogi make -C $(UNAPI_ROM_DIR)
+endif
 
 $(BUILD_DIR):
 	mkdir -p $@
