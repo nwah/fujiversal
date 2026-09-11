@@ -48,9 +48,14 @@ OK_FNUM:
 	ret
 
 	;--- Undefined function: return with registers unmodified
+	;
+	;    This used to be `jp UNDEFINED` -- a debug stub, with the pops it
+	;    was standing in front of left unreachable behind it. Any call with
+	;    a routine number this dispatcher does not recognise hung the
+	;    machine instead of returning, which the specification requires it
+	;    to do with AF, BC, DE and HL untouched.
 
 UNDEFINED:
-	jp UNDEFINED
 	pop	af
 	pop	hl
 	ret

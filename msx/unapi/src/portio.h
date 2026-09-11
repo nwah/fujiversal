@@ -19,4 +19,21 @@ extern void __FASTCALL__ port_putc(uint8_t c);
 // writes data to port handling SLIP escapes, returns number of bytes written
 extern uint16_t __CALLEE__ port_putbuf_slip(const void *buf, uint16_t len);
 
-#define VDP_IS_PAL (((unsigned char *) 0x002b) & 0x80)
+// The video standard, which callers use to scale a timeout in milliseconds
+// into frame times.
+//
+// Fixed at 60Hz, deliberately. This was written as
+//
+//   #define VDP_IS_PAL (((unsigned char *) 0x002b) & 0x80)
+//
+// which masks the *address* 0x2B rather than the byte there, so it folded to
+// a constant 0 and every timeout was already computed as NTSC. Adding the
+// dereference back would be worse than leaving it: bit 7 of 0x002B is the
+// main BIOS ROM's, and page 0 only holds the BIOS when nothing else has been
+// switched in -- under MSX-DOS and Nextor, where this ROM is meant to sit
+// resident, page 0 is RAM and that byte is whatever happens to be there.
+//
+// Nothing is lost by pinning it. timeout.s no longer counts frame interrupts
+// at all; it counts loop iterations calibrated to a 60Hz frame, so the unit
+// on the far side of this divisor is 60Hz-shaped whatever the VDP is doing.
+#define VDP_IS_PAL 0
