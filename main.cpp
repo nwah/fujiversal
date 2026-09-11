@@ -614,6 +614,8 @@ int main()
   uint32_t last_cc_seen = 0, last_ring_sent = 0, now, loop_begin;
   bool our_command = false, serial_ready = false;
   ByteBuffer command_buf;
+  // Where the demux below is in the frame arriving from the FujiNet.
+  enum { RX_IDLE, RX_DECIDING, RX_MSX_FRAME, RX_DBC_FRAME } rx_state = RX_IDLE;
 
   reset_bank_offsets();
 
@@ -680,16 +682,16 @@ int main()
 
     check_tx();
 
-    if (command_buf.size()) {
-      // Did we timeout waiting for final SLIP_END?
-      if (now - last_cc_seen > 50) {
+    // A frame addressed to us that never finished: hand the bytes to the host
+    // rather than sit on them forever.
+    if (rx_state == RX_DBC_FRAME && now - last_cc_seen > 50) {
 #if VERBOSE_DEBUG
-        DEBUG_PRINTF("Command timeout %d\r\n", command_buf.size());
+      DEBUG_PRINTF("Command timeout %d\r\n", command_buf.size());
 #endif // VERBOSE_DEBUG
-        for (char c : command_buf)
-          ring_append(ring_rx, ring_rx_in, (uint8_t) c);
-        command_buf.clear();
-      }
+      for (char c : command_buf)
+        ring_append(ring_rx, ring_rx_in, (uint8_t) c);
+      command_buf.clear();
+      rx_state = RX_IDLE;
     }
 
     tud_task();
@@ -702,34 +704,60 @@ int main()
         unsigned char rc;
         tud_cdc_read(&rc, 1);
         input = rc;
-        if (!command_buf.size() && input != SLIP_END)
-          ring_append(ring_rx, ring_rx_in, input);
-        else {
-          // if SLIP_END or already capturing then push to command_buf
-          last_cc_seen = to_ms_since_boot(get_absolute_time());
+        // Frames addressed to us ride the same link as the host's own traffic
+        // and have to come out of it before the host sees them -- a ROM push
+        // follows immediately behind the reply to the command that asked for
+        // it. Every frame is SLIP_END, body, SLIP_END and the second byte names
+        // the device, so one byte of lookahead past a leading SLIP_END says
+        // whose frame this is. Only that leading byte is ever held back: a
+        // frame the host owns goes through as it arrives, terminator included,
+        // so nothing waits on a byte that may never come.
+        switch (rx_state) {
+        case RX_IDLE:
+          if (input == SLIP_END)
+            rx_state = RX_DECIDING;             // whose frame is this?
+          else
+            ring_append(ring_rx, ring_rx_in, (uint8_t) input);
+          break;
 
-          // Keep track of when last command char was seen so we can timeout
+        case RX_DECIDING:
+          if (input == SLIP_END) {
+            // An empty frame, or a run of terminators. Give the host the one
+            // we were holding and keep waiting on this one.
+            ring_append(ring_rx, ring_rx_in, (uint8_t) SLIP_END);
+          }
+          else if (input == FUJI_DEVICEID_DBC) {
+            command_buf.clear();
+            command_buf.push_back((char) SLIP_END);
+            command_buf.push_back((char) input);
+            last_cc_seen = to_ms_since_boot(get_absolute_time());
+            rx_state = RX_DBC_FRAME;
+          }
+          else {
+            ring_append(ring_rx, ring_rx_in, (uint8_t) SLIP_END);
+            ring_append(ring_rx, ring_rx_in, (uint8_t) input);
+            rx_state = RX_MSX_FRAME;
+          }
+          break;
+
+        case RX_MSX_FRAME:
+          ring_append(ring_rx, ring_rx_in, (uint8_t) input);
+          if (input == SLIP_END)
+            rx_state = RX_IDLE;
+          break;
+
+        case RX_DBC_FRAME:
           command_buf.push_back((char) input);
-
-          size_t command_size = command_buf.size();
-          if (command_buf.size()) {
-            // If second char is not a command for us, send command_buf to RBS
-            if (command_size == 2 && input != FUJI_DEVICEID_DBC) {
-#if VERBOSE_DEBUG
-              DEBUG_PRINTF("Command not us\r\n");
-#endif // VERBOSE_DEBUG
+          last_cc_seen = to_ms_since_boot(get_absolute_time());
+          if (input == SLIP_END) {
+            if (!process_command(command_buf)) {
               for (char c : command_buf)
                 ring_append(ring_rx, ring_rx_in, (uint8_t) c);
-              command_buf.clear();
             }
-            else if (command_size > 1 && input == SLIP_END) {
-              if (!process_command(command_buf)) {
-                for (char c : command_buf)
-                  ring_append(ring_rx, ring_rx_in, (uint8_t) c);
-              }
-              command_buf.clear();
-            }
+            command_buf.clear();
+            rx_state = RX_IDLE;
           }
+          break;
         }
       }
     }
