@@ -1,6 +1,6 @@
-	extern	_port_getc, _port_getc_timeout, _port_discard_until
-	extern	_port_getbuf, _port_get_until
-	extern	_port_putc, _port_putbuf
+	extern	_port_getc, _port_getc_timeout
+	extern	_port_getbuf_slip_dual
+	extern	_port_putc, _port_putbuf_slip
 
 	extern	getbuf_done
 

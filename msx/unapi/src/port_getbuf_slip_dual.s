@@ -139,10 +139,20 @@ slipd_store_byte:
 	ld	(ix + SLIPD_PARAM_DATA_LEN+1), 0
 
 slipd_read_next:
+	; Reload the timeout. _port_getc_timeout takes it in HL and *returns*
+	; in HL, so every call clobbers it -- without this the timeout for each
+	; byte after the first is whatever the previous byte happened to be, and
+	; a payload byte of zero means no wait at all. Phases 1 and 2 reload it
+	; per call for the same reason; this loop used to skip it, which only
+	; shows when bytes arrive with gaps between them rather than already
+	; buffered, so the frame decodes short and the rest of it is left to be
+	; read back as the head of the next one.
+	ld	hl,(ix + SLIPD_PARAM_TIMEOUT)
 	SLIPD_WAIT_CHAR slipd_done
 	jr	slipd_decode_loop
 
 slipd_handle_escape:
+	ld	hl,(ix + SLIPD_PARAM_TIMEOUT)	; same as above
 	SLIPD_WAIT_CHAR slipd_done	; Read byte after ESC
 
 	cp	SLIP_ESC_END		; 0xDC -> 0xC0
