@@ -44,7 +44,52 @@ PLATFORM_COMBOS = \
   msxdos+=msx \
   adam_cpm+=adam
 
-include ../mekkogx/toplevel-rules.mk
+# Pinned rather than vendored, the same way msx/bootstrap fetches fujinet-lib
+# (see that Makefile's own $(FNLIB) rule -- same idiom, mirrored here).
+#
+# The ref is resolved to a commit before checkout, because a bare name means
+# different things depending on what it names: a commit is in the clone under
+# that name, while a branch is only there as origin/<name>, and handing that
+# name straight to "checkout --detach" makes git read it as a request for a
+# local branch and refuse.
+#
+# The clone lands beside the target and is moved into place only once the
+# checkout has worked. A directory left behind by a half-finished clone would
+# satisfy the -d test on a later run and quietly build against whatever branch
+# the clone happened to leave checked out.
+MEKKOGX_URL ?= https://github.com/FozzTexx/MekkoGX.git
+MEKKOGX_REF ?= c9442e0
+MEKKOGX     ?= _cache/mekkogx-$(MEKKOGX_REF)
+
+# The rule's target has to be the literal path being included, not just the
+# checkout directory: that is what lets make's own "remake an out-of-date
+# included makefile" pass find this rule before the include line below is
+# ever reached, on a totally fresh checkout where neither exists yet.
+#
+# Because of that same restart mechanism, this rule becomes the default goal
+# (make's default goal is the first target in the file) on a build starting
+# from nothing, ahead of mekkogx's own `all` -- hence .DEFAULT_GOAL below.
+#
+# One local patch goes on afterward: upstream's msxrom.mk sets MSXROM_FLAGS
+# unconditionally, which would stomp the -subtype=callext this project needs
+# (a UNAPI ROM is entered as a call, not run at boot, so it cannot be the
+# self-booting -subtype=rom the platform defaults to) with whatever platform
+# default happens to be linked in last. The patch changes that one line to
+# `?=`, so the project's own setting below wins and upstream's is only a
+# fallback for a caller that never set one.
+$(MEKKOGX)/mekkogx/toplevel-rules.mk:
+	mkdir -p $(dir $(MEKKOGX))
+	rm -rf $(MEKKOGX).tmp
+	git clone $(MEKKOGX_URL) $(MEKKOGX).tmp
+	git -C $(MEKKOGX).tmp checkout --detach \
+	  $$(git -C $(MEKKOGX).tmp rev-parse --verify --quiet '$(MEKKOGX_REF)^{commit}' \
+	     || git -C $(MEKKOGX).tmp rev-parse --verify 'origin/$(MEKKOGX_REF)^{commit}')
+	git -C $(MEKKOGX).tmp apply $(CURDIR)/patches/mekkogx-msxrom-flags-override.patch
+	mv $(MEKKOGX).tmp $(MEKKOGX)
+
+.DEFAULT_GOAL := all
+
+include $(MEKKOGX)/mekkogx/toplevel-rules.mk
 
 # If you need to add extra platform-specific steps, do it below:
 #   coco/r2r:: coco/custom-step1
