@@ -7,15 +7,12 @@
 INIT:
 	;--- Initialize the hooks if necessary
 	;
-	;    Bit 0 of HOKVLD says the hook block at EXTBIO has been initialized,
-	;    and that block is three hooks long: EXTBIO, then DISINT and ENAINT.
-	;    Setting the bit tells everyone that comes later -- on an MSX2 that
-	;    includes the disk ROM, which initialises the same fifteen bytes and
-	;    skips them if the bit is already set -- that all three are safe to
-	;    call. Filling in only the five bytes of EXTBIO leaves the other two
-	;    as whatever RAM came up as, and the machine dies the first time
-	;    something disables interrupts through them: on both a Philips NMS
-	;    8250 and openMSX's Boosted_MSX2_EN it never reaches BASIC.
+	;    Bit 0 of HOKVLD marks the 3-hook block at EXTBIO (EXTBIO, DISINT,
+	;    ENAINT) as initialized, so later code -- including the MSX2 disk
+	;    ROM -- knows all three are safe to call. Filling in only EXTBIO's
+	;    5 bytes leaves the other two as whatever RAM held, and the machine
+	;    dies the first time something disables interrupts through them
+	;    (confirmed on a Philips NMS 8250 and openMSX's Boosted_MSX2_EN).
 
 	ld	a,(HOKVLD)
 	bit	0,a
@@ -74,8 +71,6 @@ OK_INIEXTB:
 	;    other ROM initialization tasks.
 
 ROM_INIT:
-
-	;TODO: extend (or replace) with other initialization code as needed by your implementation
 
 	;--- Show informative message
 

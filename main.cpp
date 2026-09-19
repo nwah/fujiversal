@@ -7,11 +7,8 @@
 #include <cstddef>
 #include <cstdint>
 
-// Only boards whose .pio defines RD_PIN get a UNAPI cartridge baked in --
-// automatic mapper decoding needs /RD to tell a bus read from a write apart,
-// and the Makefile only generates this header for those boards. board_defs.h
-// has already brought in the board's PIO header (and so RD_PIN, if it has
-// one) and the STR()/BOARD_NAME machinery this reuses to name the file.
+// RD_PIN boards only: without /RD we can't tell a bus read from a write, so
+// we can't decode the subslot-select write at FFFFh.
 #ifdef RD_PIN
 #define UNAPI_ROM_PATH STR(build/BOARD_NAME/unapi_rom.h)
 #include UNAPI_ROM_PATH
@@ -102,20 +99,16 @@ volatile uint8_t user_rom_selected_bank = 0;
 volatile bool user_rom_closed = false;
 volatile bool user_rom_active = false;
 
-// One image the cartridge can put on the bus: the built-in ROM in the
-// adapter's flash (CONFIG on MSX), the UNAPI cartridge beside it (RD_PIN
-// boards only), or whatever the FujiNet last streamed into the user ROM. They differ in where they came
-// from, in which mapper they want and in which pages they answer on, so each
-// carries its own -- there is no longer one shared "current" set of any of it.
+// One of the images the cartridge can serve: built-in ROM, UNAPI, or the
+// streamed user ROM. Each has its own base/mapper/pages.
 struct rom_image {
   const uint8_t *base;
   uint32_t       size;
   fujiROMType_t  type;
   volatile uint16_t bank_size;
   volatile uint16_t bank_count;
-  // Both follow from bank_size, and both are derived once in set_image_type()
-  // rather than per read: bank_size is volatile, so the compiler must reload
-  // it at every use, and the read path used it twice.
+  // Derived once in set_image_type(), not per read: bank_size is volatile,
+  // so re-reading it costs a reload each use.
   uint8_t        bank_shift; // offset >> this == bank index
   uint16_t       bank_mask;  // offset & this == offset within the bank
   uint8_t        pages;      // bit N set => answers in page N
@@ -126,24 +119,16 @@ rom_image boot_image = { nullptr, 0, ROM_TYPE_UNKNOWN, SIZE_16K, 1, 14, SIZE_16K
 rom_image user_image = { nullptr, 0, ROM_TYPE_UNKNOWN, SIZE_16K, 1, 14, SIZE_16K - 1, 0b0110, {0, 0, 0, 0} };
 
 #ifdef RD_PIN
-// Page 1 only. That is where the ROM lives -- 16K at 4000h, nothing at
-// 8000h -- and an empty page 2 in subslot 0 is what lets the IO window sit
-// there instead of over the top of it: a cartridge in subslot 1 gets a clean
-// 4000h-BFFFh rather than having its top four bytes shadowed.
+// Page 1 only (16K at 4000h): an empty page 2 is what lets the IO window
+// live there instead of being shadowed.
 rom_image unapi_image = { nullptr, 0, ROM_TYPE_UNKNOWN, SIZE_16K, 1, 14, SIZE_16K - 1, 0b0010, {0, 0, 0, 0} };
 
-// Whether UNAPI is one of the images on offer right now.
-//
-// Both this and expanded start set: at power-on the slot is expanded with
-// UNAPI in subslot 0 and the built-in ROM in subslot 1. The BIOS walks
-// subslots in order, so UNAPI's INIT installs it before CONFIG's INIT takes
-// the machine, and CONFIG reaches the FujiNet through EXTBIO like any other
-// program. That is the same arrangement IO_CONTROL mode $3C asks for.
+// Starts true: at power-on the slot is expanded with UNAPI in subslot 0 and
+// the built-in ROM in subslot 1 (IO_CONTROL mode $3C).
 volatile bool unapi_enabled = true;
 
-// The slot presents itself as expanded, which means it owns the register at
-// FFFFh: written, it selects a subslot per page; read, it answers with the
-// complement, which is how the BIOS knows the slot is expanded at all.
+// Expanded means we own FFFFh: written, it selects a subslot per page; read,
+// it returns the complement -- how the BIOS detects an expanded slot.
 volatile bool expanded = true;
 volatile uint8_t subslot_reg = 0;
 #endif // RD_PIN
@@ -265,19 +250,15 @@ void setup_pio_irq_logic()
   return;
 }
 
-// Reset an image's banks to sequential segments. Plain multiplication, not
-// the "% bank_count" wrap a guest's own bank-register write gets below: this
-// runs at FUJICMD_OPEN, before a single byte of a streamed image has arrived,
-// so bank_count is still 1 here and that wrap would flatten every window onto
-// block 0 -- page 2 ending up mirroring page 1, which silently breaks every
-// 32K game.
+// Plain multiplication, not the bank_count wrap a guest's own bank-register
+// write gets below: bank_count is still 1 here (before any bytes arrive),
+// and that wrap would flatten every window onto block 0.
 void reset_image_banks(struct rom_image *img)
 {
   for (unsigned n = 0; n < 4; n++)
     img->bank_offsets[n] = (uint32_t)n * img->bank_size;
 }
 
-// Set an image's mapper type and the bank size/count that follow from it.
 void set_image_type(struct rom_image *img, fujiROMType_t t)
 {
   img->type = t;
@@ -290,36 +271,28 @@ void set_image_type(struct rom_image *img, fujiROMType_t t)
   reset_image_banks(img);
 }
 
-// Owned by core1's bus loop -- the built-in ROM until a user ROM is enabled,
-// then wherever the last enable or bank-select write pointed it. File-scope
-// (rather than a local in romulan(), as it used to be) so refresh_mapping()
-// can fix it up between cycles instead of romulan() re-checking it on every
-// one; the IO_CONTROL and FFFFh handling below still assign it directly, the
-// same as always.
+// File-scope so refresh_mapping() can update it between cycles instead of
+// romulan() re-deriving it every cycle.
 uint8_t *rom_ptr = disk_rom;
 
-// The mapping the read path uses: which image answers in each page, and
-// whether the IO window is decoded. Both are recomputed only when the state
-// behind them changes, never per cycle. That is the whole point -- a read has
-// to reach the bus inside the Z80's window, and re-deriving this from half a
-// dozen volatiles and a subslot register on every cycle is what put it over.
+// Which image answers in each page, and whether the IO window is decoded.
+// Recomputed only when something changes, never per cycle: a read has to
+// land inside the Z80's timing window, and rebuilding this from several
+// volatiles every cycle is what blew that budget before.
 #ifdef RD_PIN
 struct rom_image * volatile page_image[4] = { nullptr, nullptr, nullptr, nullptr };
 #endif // RD_PIN
 volatile bool io_window_live = true;
 
-// Set wherever anything the mapping depends on changes, on either core; the
-// bus loop picks it up between cycles -- after serving one, before waiting for
-// the next -- never inside a cycle's deadline. Starts set so the mapping is
-// built before the first cycle is taken.
+// Set on either core when the mapping needs rebuilding; the bus loop picks
+// it up between cycles, never mid-cycle. Starts true so the mapping is built
+// before the first cycle.
 volatile bool mapping_dirty = true;
 
-// __time_critical_func because romulan() calls this from the bus loop, and
-// romulan() is in RAM for a reason. Left in flash it is reached through a
-// veneer into XIP, and an XIP miss -- likely, since core0 runs TinyUSB out of
-// the same cache during a ROM push -- costs hundreds of nanoseconds to
-// microseconds against a read deadline of about five hundred. The cycle it
-// lands on is dropped, and so are the ones behind it.
+// __time_critical_func: called from romulan() in RAM. In flash it's reached
+// through a veneer into XIP, and a miss there -- likely, since core0 runs
+// TinyUSB from the same cache during a push -- can cost more than the
+// ~500ns read deadline, dropping that cycle and the ones behind it.
 void __time_critical_func(refresh_mapping)(void)
 {
 #ifdef RD_PIN
@@ -327,10 +300,8 @@ void __time_critical_func(refresh_mapping)(void)
     struct rom_image *img;
 
     if (expanded) {
-      // UNAPI in subslot 0; in subslot 1 whatever the FujiNet streamed
-      // across once it is enabled, and the built-in ROM until then. The BIOS
-      // walks subslots in order, so UNAPI's INIT runs and returns before
-      // subslot 1's runs and takes the machine.
+      // UNAPI in subslot 0; subslot 1 is the built-in ROM until a user ROM
+      // is enabled. BIOS walks subslots in order, so UNAPI's INIT runs first.
       unsigned ss = (subslot_reg >> (2 * page)) & 3;
       img = (ss == 0) ? &unapi_image
           : (ss == 1) ? (user_rom_active ? &user_image : &boot_image)
@@ -341,25 +312,20 @@ void __time_critical_func(refresh_mapping)(void)
           : &boot_image;
     }
 
-    // An image with no buffer, or one that does not answer in this page, is
-    // an empty socket here -- resolved now so the read path only has to test
-    // the pointer.
+    // No buffer, or wrong page: treat as unmapped so the read path only has
+    // to test the pointer.
     if (img && (!img->base || !(img->pages & (1u << page))))
       img = nullptr;
     page_image[page] = img;
   }
 
-  // Same fixup romulan() used to run every cycle: once nothing is asking for
-  // the user ROM any more, fall back to the built-in one. Every site that
-  // clears user_rom_base flags the mapping dirty, so this still runs.
+  // Nothing wants the user ROM any more: fall back to the built-in one.
   if (!user_rom_base && rom_ptr != disk_rom)
     rom_ptr = disk_rom;
 
-  // Which subslot the IO window belongs to moves with expansion: expanded,
-  // it is part of subslot 0 (UNAPI's), so whatever is in subslot 1 gets a
-  // clean 4000h-BFFFh. Unexpanded it sits over the built-in ROM as it always
-  // has, and a user ROM -- a cartridge, which expects to own all of
-  // 4000h-BFFFh -- does not get it at all.
+  // Expanded: window lives in subslot 0 (UNAPI's), so subslot 1 gets a clean
+  // 4000h-BFFFh. Unexpanded: over the built-in ROM as always, and never for
+  // a user ROM (a cartridge, which owns the whole window).
   io_window_live = expanded ? (((subslot_reg >> 4) & 3) == 0)
                             : !user_rom_active;
 #else
@@ -370,12 +336,10 @@ void __time_critical_func(refresh_mapping)(void)
 }
 
 #ifdef RD_PIN
-// Put one byte of whatever is mapped at this address on the bus, or 0xFF for
-// an empty socket. Always exactly one byte: the read state machine stalls
-// holding the bus if it gets none, so every way out of here answers.
+// Always answers exactly one byte (0xFF for empty): the read SM stalls
+// holding the bus if it gets none.
 //
-// always_inline because both callers are on the bus path and a veneer call
-// into RAM costs more than the whole lookup.
+// always_inline: a veneer call into RAM would cost more than the lookup.
 static inline __attribute__((always_inline))
 void serve_rom_read(uint16_t addr)
 {
@@ -383,7 +347,6 @@ void serve_rom_read(uint16_t addr)
   uint32_t rom_offset, idx;
   uint8_t bank;
 
-  // No image mapped, or expanded with nothing in this page's subslot.
   if (!img) {
     pio_put_fifo(PSM_READ, 0xFF);
     return;
@@ -408,21 +371,17 @@ void serve_rom_read(uint16_t addr)
   bank = rom_offset >> img->bank_shift;
 
   if (bank >= 4) {
-    // A guest-controlled bank register can compute an index past the small
-    // window this hardware actually needs; fail soft rather than index off
-    // the end of it.
+    // Guest-controlled bank register can compute past this hardware's
+    // window; fail soft instead of indexing off the end.
     pio_put_fifo(PSM_READ, 0xFF);
     return;
   }
 
   idx = img->bank_offsets[bank] + (rom_offset & img->bank_mask);
   if (idx >= img->size) {
-    // Past the end of the image, which a bank register under the guest's
-    // control can reach and a short image reaches on its own: a 16K cartridge
-    // has nothing at all in page 2. The buffer still holds whatever the last
-    // load left there, and answering with that is how the BIOS's page 2 scan
-    // finds an "AB" nobody put there. 0xFF is an empty socket, which is what
-    // this is.
+    // Past the image end -- reachable via a bank register or a short image
+    // on its own. 0xFF rather than whatever the buffer last held, which the
+    // BIOS's page-2 scan could otherwise mistake for a header.
     pio_put_fifo(PSM_READ, 0xFF);
     return;
   }
@@ -444,20 +403,14 @@ void __time_critical_func(romulan)(void)
   setup_pio_irq_logic();
 
   while (true) {
-    // Anything that changed the mapping is folded in here, *before* waiting
-    // for the next cycle rather than after taking it. refresh_mapping() is
-    // about a hundred instructions -- several hundred nanoseconds -- and the
-    // read budget from capture to a byte on the bus is well under that, so
-    // paying for it inside a cycle makes that cycle's byte late: a wrong
-    // opcode, a repeated GETC byte or a missed status bit, depending on which
-    // cycle it lands on. Here it runs straight after the previous cycle was
-    // served, in the gap before the next /SLTSL can even be captured.
-    //
-    // Writes that change the mapping (IO_CONTROL, FFFFh) loop straight back
-    // here, so the fetch that follows them is served from the new mapping.
-    // A flag core0 raises (OPEN/CLOSE/RESET) while this loop is already
-    // waiting is picked up after the next cycle instead of before it; none of
-    // those moves the image an in-flight cycle is being served from.
+    // Applied here, between cycles, never mid-cycle: refresh_mapping() costs
+    // ~100 instructions, more than the read budget, so running it inside a
+    // cycle made that cycle's byte late (wrong opcode / stale GETC / missed
+    // status bit, depending which cycle it landed on). A mapping-changing
+    // write (IO_CONTROL, FFFFh) loops back here immediately, so the next
+    // fetch already sees it; a flag core0 raises is picked up one cycle
+    // later, which is safe since it never changes what an in-flight cycle
+    // is being served from.
     if (mapping_dirty) {
       mapping_dirty = false;
       refresh_mapping();
@@ -468,21 +421,10 @@ void __time_critical_func(romulan)(void)
 #else
     bus.combined = pio_get_fifo(PSM_WAITSEL);
 #endif // PSM_SENDBUS
-    // Dropping a bus state identical to the last one is only safe on a board
-    // whose PIO can re-sample the same access. This one's cannot: wait_sel
-    // raises irq 0 once per /SLTSL assertion and then waits for the line to
-    // release before re-arming, and send_bus takes exactly one sample per IRQ,
-    // so every entry in the FIFO is a distinct access the Z80 is waiting on.
-    //
-    // Discarding one is how a read gets answered with nothing: two accesses
-    // with the same address and control bits whose data field -- sampled
-    // before this loop has pushed anything -- carries the same residue would
-    // compare equal, and the Z80 would latch whatever was left on the bus.
-    // (The stale C0h replies seen on hardware turned out not to be this: they
-    // were bytes made late by refresh_mapping() running inside a cycle, fixed
-    // at the top of this loop. This exclusion stands on its own reasoning.)
-    //
-    // coco_proto_260402 has the same handshake and was already excluded.
+    // This board's PIO can't re-sample an access (wait_sel fires once per
+    // /SLTSL and re-arms only after it's released), so every FIFO entry is a
+    // distinct cycle the Z80 is waiting on -- dropping one here would answer
+    // a real read with nothing. coco_proto_260402 has the same handshake.
 #if !defined(BOARD_picorom_coco) && !defined(BOARD_coco_proto_260402) && !defined(BOARD_msx_proto_260402)
     if (bus.combined == last_bus_state)
       continue;
@@ -494,21 +436,13 @@ void __time_critical_func(romulan)(void)
 #endif
 
 #ifdef RD_PIN
-    // The cycle with a deadline: a read of 4000h-BFFFh. That is nearly every
-    // cycle that matters and the only kind the Z80 is waiting on, so it is
-    // answered before the tests it used to sit behind -- the expanded slot's
-    // register at FFFFh and the bank-register writes -- which are rare and
-    // spend part of a budget only about half a microsecond wide.
-    //
-    // The IO window is answered here too. A status poll has the same deadline
-    // as an instruction fetch, and there is no reason for it to pay for the
-    // rest of the chain first.
+    // Fast lane: reads of 4000h-BFFFh (including the IO window) are nearly
+    // every cycle that matters, with a window only ~0.5us wide, so answer
+    // before the rarer FFFFh/bank-register checks rather than after them.
     if (!bus.rd && BUS_ROM_BASE <= bus.addr && bus.addr < BUS_ROM_TOP) {
       if (io_window_live && bus.addr >= IO_BASE) {
-        // GETC and STATUS are the readable registers; PUTC and CONTROL are
-        // write-only and read back as an unmapped byte. Answering rather than
-        // falling through matters: the read state machine stalls holding the
-        // bus if a read gets no byte at all.
+        // PUTC/CONTROL are write-only; answer 0xFF rather than fall through
+        // (the read SM must always get a byte).
         unsigned io_reg = bus.addr & 0x3;
 
         if (io_reg == IO_GETC)
@@ -537,13 +471,10 @@ void __time_critical_func(romulan)(void)
         io_reg |= 2;
 #endif // RW_PIN
 #ifdef RD_PIN
-      // Reads of this window were answered above, so anything arriving here is
-      // a write. GETC and STATUS are read-only, and this board decodes the
-      // window by address alone -- there is no R/W line folded into io_reg the
-      // way RW_PIN boards have -- so without this a write to either would run
-      // the read case and push a byte nobody asked for. The read state machine
-      // would then be one byte ahead for the rest of the session, answering
-      // every read with the one before it.
+      // Reads here were already answered above, so this is a write. No R/W
+      // line on this board, so nothing else tells GETC/STATUS's read from a
+      // write -- without this, writing either would run the read case and
+      // leave the read SM one byte ahead for the rest of the session.
       if (io_reg != IO_PUTC && io_reg != IO_CONTROL)
         io_reg = ~0u; // matches no case below
 #endif // RD_PIN
@@ -563,19 +494,15 @@ void __time_critical_func(romulan)(void)
         break;
 
       case IO_CONTROL: // Write control reg
-        // Whatever this write turns out to mean, it can change which image
-        // answers where. Flagged here rather than beside each assignment
-        // below: the flag is not read until the top of the next cycle, by
-        // which time all of them have run.
+        // Any assignment below can change the mapping; flag once here
+        // rather than after each one.
         mapping_dirty = true;
-        // Command to enable/disable user ROM, or enable/disable ROM autostart
       	if (bus.data & IO_FLAG_ROM_MODE_CMD) {
 #ifdef RD_PIN
           unapi_enabled = (bus.data & IO_FLAG_UNAPI_ENABLE) != 0;
-          // Expanding or un-expanding the slot invalidates whatever subslot
-          // was selected: the BIOS zeroes the register on its own slot scan,
-          // but that scan has not run yet when this write lands -- it is the
-          // last thing before the reset that starts it.
+          // Un/expanding invalidates any selected subslot: the BIOS zeroes
+          // this on its slot scan, but that hasn't run yet when this write
+          // lands.
           {
             bool want_expanded = (bus.data & IO_FLAG_EXPAND_SLOT) != 0;
             if (want_expanded != expanded)
@@ -583,10 +510,9 @@ void __time_critical_func(romulan)(void)
             expanded = want_expanded;
           }
 #endif // RD_PIN
-          // UNAPI is additive: a board that cannot serve it ignores the two
-          // flags above and does everything else the mode byte asks for, since
-          // CONFIG sends them unconditionally and cannot know which board it is
-          // talking to. $3D there is the plain user ROM it would have been.
+          // UNAPI is additive: boards that can't serve it just ignore these
+          // two flags and do the rest, since CONFIG can't know which board
+          // it's on. $3D degrades to plain user ROM.
           bool want_user = (bus.data & IO_FLAG_USERROM_ENABLE) != 0;
 
           // Enable/disable user ROM
@@ -610,10 +536,8 @@ void __time_critical_func(romulan)(void)
             }
           }
           else {
-            // Back to the built-in ROM. The host writes this before asking for
-            // a ROM, so drop the ready flag here too -- otherwise a second
-            // request could see the first load's and boot a buffer that is
-            // still being written.
+            // Drop the ready flag too: a second request could otherwise see
+            // the previous load's flag and boot a still-incomplete buffer.
             user_rom_active = false;
             user_rom_closed = false;
             rom_ptr = &disk_rom[0];
@@ -628,29 +552,24 @@ void __time_critical_func(romulan)(void)
       }
     }
 #ifdef RD_PIN
-    // The expanded slot's own register, outside the ROM window decoded
-    // below -- the PIO fires on /SLTSL with no address mask, so FFFFh still
-    // reaches here whenever this cartridge is selected in page 3. Read, it
-    // answers with the complement of what was written, which is how the
-    // BIOS tells an expanded slot from one that simply has RAM at FFFFh.
+    // PIO fires on /SLTSL with no address mask, so FFFFh reaches here
+    // whenever we're selected in page 3.
     else if (expanded && bus.addr == 0xFFFF) {
       if (!bus.rd) { // /RD asserted: this is a read
         pio_put_fifo(PSM_READ, (uint8_t)~subslot_reg);
       } else {
         subslot_reg = bus.data;
-        // Which subslot answers where just changed. Flagged rather than
-        // rebuilt here: with the slot expanded every inter-slot call the BIOS
-        // makes writes this register -- the 60Hz interrupt, every disk
-        // access -- and the Z80's next cycles are fetches. Doing the work now
-        // would be a stall right where the machine can least afford one.
+        // Flagged, not rebuilt here: with the slot expanded, every
+        // inter-slot call (60Hz interrupt, disk access) writes this
+        // register, and the Z80's next cycles are fetches -- rebuilding now
+        // would stall exactly where it can't afford to.
         mapping_dirty = true;
       }
     }
     else if (bus.rd && (0x4000 <= bus.addr) && (bus.addr < 0xC000)) {
-      // A bank register belongs to whichever image is mapped where it was
-      // written. Expanded, that is not necessarily the one the machine is
-      // running out of -- UNAPI switches its own banks from page 1 while a
-      // cartridge sits in page 2 of another subslot.
+      // Belongs to whichever image is mapped where it was written -- not
+      // necessarily what's running, since UNAPI banks from page 1 while a
+      // cartridge sits in another subslot's page 2.
       struct rom_image *img = page_image[bus.addr >> 14];
       if (img) {
         switch_bank = false;
@@ -843,15 +762,9 @@ bool process_command(ByteBuffer &buffer)
       user_rom_base      = user_rom;
       user_rom_write_pos = 0;
       user_rom_closed    = false;
-      // Nothing has arrived yet: size back to 0 before set_image_type()
-      // computes bank_count from it, or a stale count left over from
-      // whatever was loaded before this OPEN would survive into the new
-      // image.
+      // Before set_image_type(), or the previous image's bank count survives.
       user_image.size = 0;
       set_image_type(&user_image, rt);
-      // This runs on core0, and the mapping belongs to core1's bus loop, so
-      // it is flagged rather than rebuilt here -- romulan() picks it up
-      // between cycles.
       mapping_dirty = true;
       reply(true);
 #if VERBOSE_DEBUG
@@ -868,10 +781,7 @@ bool process_command(ByteBuffer &buffer)
         break;
       }
 
-      // Clamp against what's left from user_rom_base to the end of the
-      // buffer, not the whole buffer -- this OPEN never sets a non-zero
-      // base (see the comment there), but a future one that did must not
-      // be able to write past the end of user_rom.
+      // Measured from user_rom_base in case OPEN ever sets a non-zero one.
       size_t base_offset = (size_t)(user_rom_base - user_rom);
       size_t used = base_offset + (size_t)user_rom_write_pos;
       size_t avail = used < sizeof(user_rom) ? sizeof(user_rom) - used : 0;
@@ -910,22 +820,17 @@ bool process_command(ByteBuffer &buffer)
         user_rom_closed     = false;
         user_image.bank_count = 1;
         reset_image_banks(&user_image);
-        // Same as OPEN above: core1 owns the mapping, so just flag it.
         mapping_dirty = true;
         sendReplyPacket(packet->device(), true, nullptr, 0);
         break;
       }
 
-      // How many banks the image actually turned out to be -- not knowable at
-      // OPEN, which is where the type (and so the bank size) is set: nothing
-      // on the wire says how large the image is, so this is the first moment
-      // it's known at all.
+      // From what was written: the declared size may be 0 (unknown).
       user_image.size = (uint32_t)user_rom_write_pos;
       if (user_rom_write_pos > 0)
         user_image.bank_count = (uint16_t)((user_rom_write_pos + user_image.bank_size - 1) / user_image.bank_size);
       if (user_image.bank_count == 0)
         user_image.bank_count = 1;
-      // Same as OPEN above: core1 owns the mapping, so just flag it.
       mapping_dirty = true;
       user_rom_write_pos = -1;
       user_rom_closed = true;
@@ -944,7 +849,6 @@ bool process_command(ByteBuffer &buffer)
     user_rom_closed = false;
     user_rom_selected_bank = 0;
     user_image.bank_count = 1;
-    // Same as OPEN above: core1 owns the mapping, so just flag it.
     mapping_dirty = true;
     break;
 
@@ -967,13 +871,9 @@ int main()
   uint32_t last_cc_seen = 0, last_ring_sent = 0, now, loop_begin;
   bool our_command = false, serial_ready = false;
   ByteBuffer command_buf;
-  // Where the demux below is in the frame arriving from the FujiNet.
   enum { RX_IDLE, RX_DECIDING, RX_MSX_FRAME, RX_DBC_FRAME } rx_state = RX_IDLE;
 
-  // Configure the images that never change after boot. user_image is left at
-  // its zeroed default until FUJICMD_OPEN gives it a type -- see
-  // process_command() -- and the bus side gives it a base once the host
-  // enables it -- see the IO_CONTROL handling in romulan().
+  // user_image gets its type at FUJICMD_OPEN and its base in IO_CONTROL.
   boot_image.base = disk_rom;
   boot_image.size = sizeof(disk_rom);
   set_image_type(&boot_image, ROM_TYPE_MSX_PLAIN);
@@ -1047,8 +947,8 @@ int main()
 
     check_tx();
 
-    // A frame addressed to us that never finished: hand the bytes to the host
-    // rather than sit on them forever.
+    // A frame addressed to us that never finished: hand the bytes to the
+    // host rather than sit on them forever.
     if (rx_state == RX_DBC_FRAME && now - last_cc_seen > 50) {
 #if VERBOSE_DEBUG
       DEBUG_PRINTF("Command timeout %d\r\n", command_buf.size());
@@ -1069,25 +969,21 @@ int main()
         unsigned char rc;
         tud_cdc_read(&rc, 1);
         input = rc;
-        // Frames addressed to us ride the same link as the host's own traffic
-        // and have to come out of it before the host sees them -- a ROM push
-        // follows immediately behind the reply to the command that asked for
-        // it. Every frame is SLIP_END, body, SLIP_END and the second byte names
-        // the device, so one byte of lookahead past a leading SLIP_END says
-        // whose frame this is. Only that leading byte is ever held back: a
-        // frame the host owns goes through as it arrives, terminator included,
-        // so nothing waits on a byte that may never come.
+        // One byte of lookahead past a leading SLIP_END says whose frame
+        // this is (every frame is SLIP_END, body, SLIP_END, and the second
+        // byte names the device) -- so only that leading byte is ever held
+        // back.
         switch (rx_state) {
         case RX_IDLE:
           if (input == SLIP_END)
-            rx_state = RX_DECIDING;             // whose frame is this?
+            rx_state = RX_DECIDING;
           else
             ring_append(ring_rx, ring_rx_in, (uint8_t) input);
           break;
 
         case RX_DECIDING:
           if (input == SLIP_END) {
-            // An empty frame, or a run of terminators. Give the host the one
+            // Empty frame, or a run of terminators: give the host the one
             // we were holding and keep waiting on this one.
             ring_append(ring_rx, ring_rx_in, (uint8_t) SLIP_END);
           }

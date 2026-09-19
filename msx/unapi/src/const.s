@@ -57,14 +57,8 @@ FN_UNDEFINED:
 	ret
 
 ;--- Routines 2 and 3 are the transport itself, entered with interrupts
-;    exactly as the client left them.
-;
-;    They used to be wrapped in EI/DI: a client reaches this entry point
-;    through an inter-slot call, the MSX inter-slot call routines disable
-;    interrupts, and the transport timed its waits off JIFFY, which only the
-;    frame interrupt advances. But running with interrupts on here means an
-;    interrupt can be taken while this ROM is sitting in the client's page 1,
-;    and a client whose own code is what the machine needs at interrupt time
-;    -- a disk kernel, say -- does not survive it. The timeouts count loops
-;    instead now, so there is nothing here to turn interrupts on for. See
-;    timeout.s.
+;    exactly as the client left them -- not force-enabled as they used to
+;    be, since an interrupt taken while this ROM sits in the client's page 1
+;    doesn't survive a client whose own code the machine needs at interrupt
+;    time (a disk kernel, say). Timeouts count loops instead of JIFFY now,
+;    so nothing here needs interrupts on. See timeout.s.

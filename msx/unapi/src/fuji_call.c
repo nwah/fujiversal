@@ -42,10 +42,6 @@ static void hexdump(uint8_t *buffer, int count)
 }
 #endif /* HEXDUMP */
 
-/* Direction is now conveyed by the FUJI_CALL_* routine numbers
- * (FUJI_CALL_WRITE=2, FUJI_CALL_READ=3) that live in FujiNetParams and
- * fuji_call.h.  The old Atari SIO-direction enum is gone. */
-
 #define milliseconds_to_jiffy(millis) ((millis) / (VDP_IS_PAL ? 20 : 1000 / 60))
 
 #define TIMEOUT         milliseconds_to_jiffy(100)
@@ -109,12 +105,9 @@ static uint16_t fuji_calc_checksum(const void *ptr, uint16_t len, uint16_t seed)
   return chk;
 }
 
-/*--- Transport: SLIP-encode a fujibus_packet over the IO window and
- *    read back the reply.  `func` is FUJI_CALL_WRITE or FUJI_CALL_READ.
- *
- *    The primary slot for page 2 is restored first (cheap, no page-3
- *    dance) and the subslot register is handled by io_window_enter/exit,
- *    which are no-ops on boards whose slot is not expanded.
+/*--- SLIP-encode a fujibus_packet over the IO window and read back the
+ *    reply. `func` is FUJI_CALL_WRITE or FUJI_CALL_READ. io_window_enter/
+ *    exit handle the subslot register and are no-ops if not expanded.
  */
 static uint8_t fuji_packet_call(uint8_t func, fujibus_packet *packet_ptr,
                                 void *pbuf, uint16_t plen)
@@ -143,12 +136,10 @@ static uint8_t fuji_packet_call(uint8_t func, fujibus_packet *packet_ptr,
   packet_ptr->header.checksum = ck1;
 
   /*--- Page in memory-mapped IO ---
-   * The primary slot for page 2 must match page 1 (the fujiveral).  In the
-   * expanded case both are already the same primary slot, so the write is a
-   * no-op; in the unexpanded case it makes the IO window visible.
-   * io_window_enter() then handles the SUBSLOT register (0xFFFF) so page 2
-   * is in this ROM's own subslot even if the client left it pointing at
-   * another one (the cartridge).
+   * Page 2's primary slot must match page 1's (the fujiveral) -- a no-op if
+   * already expanded, or what makes the window visible if not. io_window_
+   * enter() then points page 2 at our own subslot, in case the client left
+   * it on another one (the cartridge).
    */
   my_slot = msx_get_page_slot(1);
   saved_slot = msx_get_page_slot(2);
@@ -183,7 +174,6 @@ static uint8_t fuji_packet_call(uint8_t func, fujibus_packet *packet_ptr,
   }
 #endif /* DEBUG */
 
-  // Need to zero out checksum in order to calculate
   ck1 = packet_ptr->header.checksum;
   packet_ptr->header.checksum = 0;
 

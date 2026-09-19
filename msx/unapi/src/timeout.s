@@ -3,20 +3,18 @@
 ; ============================================================
 ; Timeout routines for the receive loop
 ; ------------------------------------------------------------
-; These used to time their waits off JIFFY, which only the frame interrupt
-; advances. That made the transport unusable with interrupts off, and turning
-; them on for the length of a call is not something this ROM may do: a client
-; reaches it through an inter-slot call, so while the call runs the client's
-; own slot is out of page 1. An interrupt taken in that window runs the
-; machine's interrupt path with whatever the client had there missing -- under
-; Nextor that is the disk kernel, and the boot dies a few sectors in.
+; These used to time off JIFFY, which only the frame interrupt advances --
+; unusable with interrupts off, and this ROM can't turn them on for a call:
+; a client reaches it through an inter-slot call, so its own slot is out of
+; page 1 while the call runs, and an interrupt taken then runs with whatever
+; the client had there missing (under Nextor, the disk kernel -- boot dies a
+; few sectors in).
 ;
-; So the wait is counted rather than clocked. TICK_LOOPS is how many times
-; timeout_check is called in the time one frame interrupt would have taken,
-; measured in the receive loop of port_getc_timeout, which is its only caller:
-; a 3.58MHz Z80 gets through about 13,900 turns of that loop a second, so 232
-; of them is a 60Hz frame. Timeouts keep the units the callers already use,
-; and a faster CPU simply makes them shorter in real time.
+; So the wait is counted instead. TICK_LOOPS is how many timeout_check calls
+; fit in one frame interrupt's time, measured in port_getc_timeout's receive
+; loop (its only caller): ~13,900 loops/sec on a 3.58MHz Z80, so 232 per 60Hz
+; frame. Units stay what callers already use; a faster CPU just shortens the
+; real time.
 ;
 ; timeout_init    - HL = timeout duration (in frame times)
 ;                   pushes the timeout and a fresh loop count on the stack
@@ -83,9 +81,9 @@ timeout_elapsed:
 ; ------------------------------------------------------------
 timeout_cleanup:
 	pop	af		; save return address
-	inc	sp		; discard a byte
-	inc	sp		; discard a byte
-	inc	sp		; discard a byte
-	inc	sp		; discard a byte
+	inc	sp		; discard COUNT and TIMEOUT (4 bytes)
+	inc	sp
+	inc	sp
+	inc	sp
 	push	af		; restore return address
 	ret

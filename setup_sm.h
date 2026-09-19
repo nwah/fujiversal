@@ -31,10 +31,8 @@ typedef struct {
 
   int jmp_pin;         // -1 = skip
 
-  // A state machine that only ever receives can take the transmit half of its
-  // FIFO as extra receive depth, and vice versa: 8 entries instead of 4. Zero
-  // (PIO_FIFO_JOIN_NONE) leaves it split, which is what every board that does
-  // not set this gets.
+  // 0 (PIO_FIFO_JOIN_NONE) leaves the FIFO split 4/4; joined, one direction
+  // gets all 8 entries.
   enum pio_fifo_join fifo_join;
 } sm_setup_t;
 

@@ -1,37 +1,18 @@
 ;--- subslot.s: Subslot register access for the UNAPI ROM's IO window ---
 ;
-; The IO window at 0xBFFCh lives in page 2 of the subslot this ROM is in.
-; When something else occupies another subslot of the same primary slot,
-; the BIOS may leave page 2 pointing at it, hiding the window from the
-; transport.  These routines temporarily select our own subslot for page 2.
+; The IO window at 0xBFFCh lives in page 2 of our own subslot. If another
+; subslot is mapped into page 2, these routines switch it to ours first.
+; Which subslot that is comes from the register's own page 1 field, since
+; this ROM is what page 1 holds while a call runs.
 ;
-; Which subslot that is comes out of the subslot register itself rather than
-; being assumed: while a call runs this ROM is what page 1 holds, so the
-; register's page 1 field names our subslot.  The adapter puts us in subslot
-; 0 whenever the slot is expanded, but nothing here depends on that -- an
-; emulator or a board that lands us elsewhere works the same.
+; Reaching the register at 0xFFFF needs page 3 mapped to the fujiveral (it's
+; memory-mapped, decoded only then), and page 3 normally holds the stack --
+; so interrupts are disabled and no stack access happens while page 3 is
+; remapped. The switch is written out in both routines rather than shared,
+; because a shared routine's RET would need a stack that is not there.
 ;
-; Accessing the subslot register at 0xFFFF requires page 3 to be mapped
-; to the fujiveral: the register is memory-mapped (not an I/O port), and
-; the firmware only decodes it when page 3's primary slot is this one.
-; Page 3 normally holds the stack, so we disable interrupts and switch
-; page 3 only briefly — no stack operations occur in that window.  The
-; interrupt-flag state is preserved with LD A,I / PUSH AF / DI … POP AF
-; / conditional EI.  PUSH AF and POP AF straddle the page-3 switch but
-; never land inside it, so the stack itself is never touched while page 3
-; is remapped.  For the same reason the switch is written out in both
-; routines rather than factored into one: a CALL to it could return, but
-; its RET could not, because the return address is on a stack that is not
-; there any more.
-;
-; Nothing here is kept in memory.  A `defb` in this file lands in the ROM,
-; where a store is silently dropped and the read-back is whatever was
-; assembled -- so the primary slot register stays in D for the few
-; instructions that need it, and the one value that has to outlive
-; io_window_enter (the subslot register as it was found) is handed back to
-; the caller to pass to io_window_exit.  Neither routine needs a "did I
-; change anything" flag: both work it out from EXPTBL, so every byte value
-; the subslot register can hold round-trips unambiguously.
+; Neither routine needs a "did I change anything" flag: both re-test EXPTBL
+; themselves, so every possible register value round-trips unambiguously.
 
 		INCLUDE	"const.inc"
 
@@ -59,9 +40,6 @@ _io_window_enter:
 	jr	z,enter_quiet
 
 	; --- Expanded: manipulate the subslot register at 0xFFFF ---
-	; Save interrupt state on the CURRENT stack (page 3 = main RAM),
-	; then disable interrupts before switching page 3.  The push/pop
-	; straddle the page-3 switch but never land inside it.
 	ld	a,i			; P/V = IFF2
 	push	af			; save interrupt state (stack is still main RAM)
 	di

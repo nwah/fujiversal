@@ -6,16 +6,9 @@ else
   ROM_IMAGE = config-msx.rom
 endif
 
-# The MSX-UNAPI cartridge, baked beside the ROM above rather than instead of
-# it: at power-on it sits in subslot 0 of an expanded slot, with that ROM in
-# subslot 1, so the BIOS installs UNAPI before anything else runs and every
-# program on the machine can reach the FujiNet through EXTBIO. See msx/unapi.
-#
-# It only goes in on boards whose .pio defines RD_PIN. Putting two images on
-# the bus at once means owning the subslot register at FFFFh, and without /RD
-# the Pico cannot tell a bus read from a write and so cannot see the write
-# that selects a subslot. Detected rather than naming boards, so this does not
-# need touching when a board gains or loses the pin.
+# MSX-UNAPI cartridge, baked beside the ROM above (see msx/unapi). Only on
+# boards whose .pio defines RD_PIN: without /RD we can't decode the
+# subslot-select write at FFFFh needed to put both images on the bus.
 HAS_RD := $(shell grep -c RD_PIN boards/$(BOARD).pio)
 
 UNAPI_ROM_DIR = msx/unapi

@@ -75,15 +75,10 @@ void waitsel_init_setup(sm_setup_t *setup)
 %}
 
 .program send_bus
-; One capture per /SLTSL assertion, then straight back to waiting for the next.
-;
-; This used to spin here comparing pins against the ones just captured, and
-; only re-arm once something changed -- re-deriving "a new access has started"
-; from raw pin motion, because this state machine cannot see /SLTSL itself
-; (GPIO 32 is outside its GPIO base of 0) and so watched all 32 lines including
-; the floating data bus. wait_sel raises the IRQ once per assertion and the
-; wait clears it, so nothing here has to work that out for itself, and
-; romulan() already drops a repeated bus state on the C side.
+; One capture per /SLTSL assertion, then straight back to waiting for the
+; next. This SM can't see /SLTSL itself (GPIO 32 is outside its GPIO base of
+; 0), but wait_sel already re-arms on it via the IRQ, so no need to re-derive
+; "a new access started" by polling pins here.
 idle:
         wait 1 irq next 0               ; IRQ sent when we are selected
 
@@ -111,10 +106,8 @@ void send_bus_init_setup(sm_setup_t *setup)
   setup->push_threshold	    = 32;
   setup->sideset_base	    = -1;
   setup->jmp_pin	    = -1;
-  // Receive only, so take the transmit half as extra depth. When this fills,
-  // the autopush in `in y, PIN_COUNT` stalls, and a state machine stalled
-  // there is not waiting on the IRQ, so wait_sel's next `irq 0` lands on a
-  // flag that is already set and that access is captured by nobody.
+  // Receive only: take the transmit half as extra depth, so a full FIFO
+  // stalling the autopush doesn't leave an access uncaptured.
   setup->fifo_join	    = PIO_FIFO_JOIN_RX;
 };
 %}

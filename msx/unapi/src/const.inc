@@ -18,11 +18,8 @@
 ;***  CONSTANTS  ***
 ;*******************
 
-; 0: Copy the old EXTBIO hook directly to the area for our slot in SLTWRK
-;    (enough if we don't need space in page 3 for anything else).
-;
-; 1: Allocate 5 bytes in page 3, copy old EXTBIO hook there, set allocated address
-;    in the area for our slot in SLTWRK.
+; 0: copy the old EXTBIO hook directly into our slot's SLTWRK area.
+; 1: allocate 5 bytes in page 3 for it instead.
 
 ALLOC_P3:	equ	0
 
@@ -45,8 +42,6 @@ HOOK_LEN:	equ	5
 HOOKS_LEN:	equ	ENAINT+HOOK_LEN-EXTBIO
 
 ;--- API version and implementation version
-
-;TODO: Adjust for your implementation
 
 API_V_P:	equ	1
 API_V_S:	equ	0
