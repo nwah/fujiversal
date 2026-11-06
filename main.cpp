@@ -77,10 +77,11 @@ pio_sm_t state_machine[3];
 
 #define RING_SIZE 1024
 #define ring_append(buf, in, x) ({buf[in] = x; in = (in + 1) % sizeof(buf); })
+// Drops the byte if the ring is full: core 1 can't be stalled.
 #define check_tx() ({ \
       if (multicore_fifo_rvalid()) {                    \
         bus.combined = multicore_fifo_pop_blocking();   \
-        ring_append(ring_tx, ring_tx_in, bus.data);     \
+        tx_put(bus.data);                               \
       }                                                 \
     })
 
@@ -354,6 +355,58 @@ void __time_critical_func(romulan)(void)
   return;
 }
 
+// Replies share this ring with IO_PUTC bytes so a reply can't land mid-frame.
+unsigned char ring_tx[RING_SIZE];
+unsigned ring_tx_in = 0, ring_tx_out = 0;
+
+void tx_drain(void)
+{
+  if (ring_tx_in == ring_tx_out)
+    return;
+
+#ifdef USE_STDIO
+  putchar(ring_tx[ring_tx_out]);
+  ring_tx_out = (ring_tx_out + 1) % sizeof(ring_tx);
+#else
+  unsigned contig = (ring_tx_in > ring_tx_out)
+    ? (ring_tx_in - ring_tx_out)
+    : (sizeof(ring_tx) - ring_tx_out);
+
+  while (tud_cdc_write_available() < 1)
+    tud_task();
+
+  uint32_t room = tud_cdc_write_available();
+  uint32_t to_write = (contig < room) ? contig : room;
+  uint32_t written = tud_cdc_write(&ring_tx[ring_tx_out], to_write);
+  tud_cdc_write_flush();
+  ring_tx_out = (ring_tx_out + written) % sizeof(ring_tx);
+#endif // USE_STDIO
+}
+
+bool tx_put(uint8_t c)
+{
+  unsigned next = (ring_tx_in + 1) % sizeof(ring_tx);
+
+  if (next == ring_tx_out)
+    return false;
+
+  ring_tx[ring_tx_in] = c;
+  ring_tx_in = next;
+  return true;
+}
+
+// Waits for room rather than dropping: a truncated reply desyncs the link.
+void tx_enqueue(const uint8_t *data, size_t length)
+{
+  while (length--) {
+    while (!tx_put(*data)) {
+      tx_drain();
+      tud_task();
+    }
+    data++;
+  }
+}
+
 void sendReplyPacket(fujiDeviceID_t source, bool ack, void *data, size_t length)
 {
     FujiBusPacket packet(source, ack ? FUJICMD_ACK : FUJICMD_NAK,
@@ -363,15 +416,7 @@ void sendReplyPacket(fujiDeviceID_t source, bool ack, void *data, size_t length)
     DEBUG_PRINTF("Sending reply: dev:%02x cmd:%02x len:%04x\n",
            packet.device(), packet.command(), encoded.size());
 #endif // VERBOSE_DEBUG
-#ifdef USE_STDIO
-    fwrite(encoded.data(), 1, encoded.size(), stdout);
-    fflush(stdout);
-#else
-    tud_cdc_write(encoded.data(), (uint32_t) encoded.size());
-    tud_cdc_write_flush();
-    while (tud_cdc_write_available() < CFG_TUD_CDC_TX_BUFSIZE)
-      tud_task();
-#endif // USE_STDIO
+    tx_enqueue(encoded.data(), encoded.size());
 #if VERBOSE_DEBUG
     DEBUG_PRINTF("Sent\n");
 #endif // VERBOSE_DEBUG
@@ -459,12 +504,12 @@ int main()
   BusSignals bus;
   int input;
   unsigned int count = 0;
-  unsigned char ring_rx[RING_SIZE], ring_tx[RING_SIZE];
+  unsigned char ring_rx[RING_SIZE];
   unsigned ring_rx_in = 0, ring_rx_out = 0;
-  unsigned ring_tx_in = 0, ring_tx_out = 0;
   uint32_t last_cc_seen = 0, last_ring_sent = 0, now, loop_begin;
   bool our_command = false, serial_ready = false;
   ByteBuffer command_buf;
+  enum { RX_IDLE, RX_DECIDING, RX_MSX_FRAME, RX_DBC_FRAME } rx_state = RX_IDLE;
 
 
 #ifdef BOARD_coco_proto_260402
@@ -540,16 +585,15 @@ int main()
 
     check_tx();
 
-    if (command_buf.size()) {
-      // Did we timeout waiting for final SLIP_END?
-      if (now - last_cc_seen > 50) {
+    // Timed out waiting for the final SLIP_END: hand the bytes to the host.
+    if (rx_state == RX_DBC_FRAME && now - last_cc_seen > 50) {
 #if VERBOSE_DEBUG
-        DEBUG_PRINTF("Command timeout %d\r\n", command_buf.size());
+      DEBUG_PRINTF("Command timeout %d\r\n", command_buf.size());
 #endif // VERBOSE_DEBUG
-        for (char c : command_buf)
-          ring_append(ring_rx, ring_rx_in, (uint8_t) c);
-        command_buf.clear();
-      }
+      for (char c : command_buf)
+        ring_append(ring_rx, ring_rx_in, (uint8_t) c);
+      command_buf.clear();
+      rx_state = RX_IDLE;
     }
 
     tud_task();
@@ -562,34 +606,53 @@ int main()
         unsigned char rc;
         tud_cdc_read(&rc, 1);
         input = rc;
-        if (!command_buf.size() && input != SLIP_END)
-          ring_append(ring_rx, ring_rx_in, input);
-        else {
-          // if SLIP_END or already capturing then push to command_buf
-          last_cc_seen = to_ms_since_boot(get_absolute_time());
+        // The byte after a leading SLIP_END names the device, so only that
+        // SLIP_END is held back.
+        switch (rx_state) {
+        case RX_IDLE:
+          if (input == SLIP_END)
+            rx_state = RX_DECIDING;
+          else
+            ring_append(ring_rx, ring_rx_in, (uint8_t) input);
+          break;
 
-          // Keep track of when last command char was seen so we can timeout
+        case RX_DECIDING:
+          if (input == SLIP_END) {
+            // Empty frame: release the held SLIP_END, keep holding this one.
+            ring_append(ring_rx, ring_rx_in, (uint8_t) SLIP_END);
+          }
+          else if (input == FUJI_DEVICEID_DBC) {
+            command_buf.clear();
+            command_buf.push_back((char) SLIP_END);
+            command_buf.push_back((char) input);
+            last_cc_seen = to_ms_since_boot(get_absolute_time());
+            rx_state = RX_DBC_FRAME;
+          }
+          else {
+            ring_append(ring_rx, ring_rx_in, (uint8_t) SLIP_END);
+            ring_append(ring_rx, ring_rx_in, (uint8_t) input);
+            rx_state = RX_MSX_FRAME;
+          }
+          break;
+
+        case RX_MSX_FRAME:
+          ring_append(ring_rx, ring_rx_in, (uint8_t) input);
+          if (input == SLIP_END)
+            rx_state = RX_IDLE;
+          break;
+
+        case RX_DBC_FRAME:
           command_buf.push_back((char) input);
-
-          size_t command_size = command_buf.size();
-          if (command_buf.size()) {
-            // If second char is not a command for us, send command_buf to RBS
-            if (command_size == 2 && input != FUJI_DEVICEID_DBC) {
-#if VERBOSE_DEBUG
-              DEBUG_PRINTF("Command not us\r\n");
-#endif // VERBOSE_DEBUG
+          last_cc_seen = to_ms_since_boot(get_absolute_time());
+          if (input == SLIP_END) {
+            if (!process_command(command_buf)) {
               for (char c : command_buf)
                 ring_append(ring_rx, ring_rx_in, (uint8_t) c);
-              command_buf.clear();
             }
-            else if (command_size > 1 && input == SLIP_END) {
-              if (!process_command(command_buf)) {
-                for (char c : command_buf)
-                  ring_append(ring_rx, ring_rx_in, (uint8_t) c);
-              }
-              command_buf.clear();
-            }
+            command_buf.clear();
+            rx_state = RX_IDLE;
           }
+          break;
         }
       }
     }
@@ -608,25 +671,8 @@ int main()
       }
     }
 
-    if (serial_ready && ring_tx_in != ring_tx_out) {
-#ifdef USE_STDIO
-      putchar(ring_tx[ring_tx_out]);
-      ring_tx_out = (ring_tx_out + 1) % sizeof(ring_tx);
-#else
-      unsigned contig = (ring_tx_in > ring_tx_out)
-        ? (ring_tx_in - ring_tx_out)
-        : (sizeof(ring_tx) - ring_tx_out);
-
-      while (tud_cdc_write_available() < 1)
-        tud_task();
-
-      uint32_t room = tud_cdc_write_available();
-      uint32_t to_write = (contig < room) ? contig : room;
-      uint32_t written = tud_cdc_write(&ring_tx[ring_tx_out], to_write);
-      tud_cdc_write_flush();
-      ring_tx_out = (ring_tx_out + written) % sizeof(ring_tx);
-#endif // USE_STDIO
-    }
+    if (serial_ready)
+      tx_drain();
   }
 
   return 0;
