@@ -101,7 +101,8 @@ volatile bool mapping_dirty = true;
 volatile bool restore_power_on = false;
 
 #ifdef RD_PIN
-// $3C power-on, $3D user ROM in subslot 1, $1C unexpanded UNAPI alone.
+// $3C power-on, $3D user ROM in subslot 0, $1C unexpanded UNAPI alone.
+// Expanded: 0 user ROM, 1 UNAPI and IO window, 2 CONFIG.
 static bool expanded = true, unapi_enabled = true;
 static uint8_t subslot_reg = 0;
 static const uint8_t *page_base[4];
@@ -128,9 +129,11 @@ void __time_critical_func(refresh_mapping)(void)
     if (expanded) {
       unsigned sub = (subslot_reg >> (2 * page)) & 3;
       if (sub == 0)
-        image = IMG_UNAPI;
+        image = user_base ? IMG_USER : IMG_NONE;
       else if (sub == 1)
-        image = user_base ? IMG_USER : IMG_BUILTIN;
+        image = IMG_UNAPI;
+      else if (sub == 2 && !user_base)
+        image = IMG_BUILTIN;
       else
         image = IMG_NONE;
     }
@@ -158,7 +161,7 @@ void __time_critical_func(refresh_mapping)(void)
   }
 
   page_is_user = is_user;
-  io_window_live = expanded ? (((subslot_reg >> 4) & 3) == 0) : (user_base == nullptr);
+  io_window_live = expanded ? (((subslot_reg >> 4) & 3) == 1) : (user_base == nullptr);
 }
 #endif // RD_PIN
 

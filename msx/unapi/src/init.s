@@ -16,7 +16,7 @@ INIT:
 
         ld      a,(HOKVLD)
         bit     0,a
-        jr      nz,OK_INIEXTB
+        jr      nz,CHK_INSTALLED
 
         ld      hl,EXTBIO
         ld      de,EXTBIO+1
@@ -26,6 +26,23 @@ INIT:
 
         or      1
         ld      (HOKVLD),a
+        jr      OK_INIEXTB
+
+        ;--- A client may already have run us (see fujinet-lib's discovery).
+        ;    Hooking twice would chain the hook to itself.
+
+CHK_INSTALLED:
+        ld      hl,UNAPI_ID
+        ld      de,ARG
+        ld      bc,8
+        ldir
+        ld      de,2222h
+        xor     a
+        ld      b,a
+        call    EXTBIO
+        ld      a,b
+        or      a
+        ret     nz
 OK_INIEXTB:
 
         ;--- Save previous EXTBIO hook
