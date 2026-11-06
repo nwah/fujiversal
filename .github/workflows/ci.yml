@@ -57,18 +57,6 @@ jobs:
           chmod +x "$RUNNER_TEMP/bin/defoogi"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
-      # config-msx.rom comes from fujinet-config and isn't in this repo, so
-      # MSX boards are compiled against a blank placeholder image.
-      - name: Create placeholder MSX ROM
-        if: ${{ !contains(matrix.board, 'coco') }}
-        run: head -c 32768 /dev/zero | tr '\0' '\377' > config-msx.rom
-
-      # Checkout doesn't preserve mtimes, so the committed CoCo ROM can end up
-      # older than the msxio sources it nominally depends on, and make would
-      # then try to rebuild it with z88dk.
-      - name: Mark committed ROM as up to date
-        run: touch hdbdw3bc3.rom
-
       - name: Build firmware
         run: make BOARD=${{ matrix.board }}
 
