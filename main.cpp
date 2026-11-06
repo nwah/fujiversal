@@ -233,7 +233,7 @@ void __time_critical_func(romulan)(void)
 #else
     bus.combined = pio_get_fifo(PSM_WAITSEL);
 #endif // PSM_SENDBUS
-#if !defined(BOARD_picorom_coco) && !defined(BOARD_coco_proto_260402)
+#if !defined(BOARD_picorom_coco) && !defined(BOARD_coco_proto_260402) && !defined(BOARD_msx_proto_260402)
     if (bus.combined == last_bus_state)
       continue;
 #endif
