@@ -8,6 +8,11 @@
 #include <cstddef>
 #include <cstdint>
 
+#ifdef RD_PIN
+#define UNAPI_ROM_PATH STR(build/BOARD_NAME/unapi_rom.h)
+#include UNAPI_ROM_PATH
+#endif // RD_PIN
+
 #define VERBOSE_DEBUG 0
 
 #ifdef USE_STDIO
@@ -40,6 +45,8 @@
 #define IO_FLAG_ROM_MODE_CMD     0b00000100
 #define IO_FLAG_USERROM_ENABLE   0b00000001
 #define IO_FLAG_AUTOSTART_ENABLE 0b00000010
+#define IO_FLAG_UNAPI_ENABLE     0b00010000
+#define IO_FLAG_EXPAND_SLOT      0b00100000
 #define IO_FLAG_ROM_BANK_CMD     0b10000000
 #define IO_MASK_ROM_BANK         0b00001111
 
@@ -87,6 +94,73 @@ pio_sm_t state_machine[3];
 
 UserROM user_rom;
 Mapper mapper;
+
+// Set on either core, consumed only between cycles in romulan().
+volatile bool mapping_dirty = true;
+// Set by FUJICMD_RESET: go back to the $3C power-on arrangement.
+volatile bool restore_power_on = false;
+
+#ifdef RD_PIN
+// $3C power-on, $3D user ROM in subslot 1, $1C unexpanded UNAPI alone.
+static bool expanded = true, unapi_enabled = true;
+static uint8_t subslot_reg = 0;
+static const uint8_t *page_base[4];
+static uint8_t page_is_user;
+static bool io_window_live;
+
+// Must not run inside a cycle (it makes bytes late), and must be in RAM.
+void __time_critical_func(refresh_mapping)(void)
+{
+  enum { IMG_NONE, IMG_UNAPI, IMG_BUILTIN, IMG_USER };
+  const uint8_t *user_base = user_rom.activeBase;
+  uint8_t is_user = 0;
+
+  if (restore_power_on) {
+    restore_power_on = false;
+    expanded = unapi_enabled = true;
+    subslot_reg = 0;
+  }
+
+  for (unsigned page = 0; page < 4; page++) {
+    unsigned image;
+    const uint8_t *base = nullptr;
+
+    if (expanded) {
+      unsigned sub = (subslot_reg >> (2 * page)) & 3;
+      if (sub == 0)
+        image = IMG_UNAPI;
+      else if (sub == 1)
+        image = user_base ? IMG_USER : IMG_BUILTIN;
+      else
+        image = IMG_NONE;
+    }
+    else if (unapi_enabled)
+      image = IMG_UNAPI;
+    else
+      image = user_base ? IMG_USER : IMG_BUILTIN;
+
+    switch (image) {
+    case IMG_UNAPI:
+      if (page == 1)
+        base = unapi_rom;
+      break;
+    case IMG_BUILTIN:
+      if (page == 1 || (page == 2 && sizeof(DEFAULT_ROM) > SIZE_16K))
+        base = DEFAULT_ROM;
+      break;
+    case IMG_USER:
+      base = user_base;
+      is_user |= 1 << page;
+      break;
+    }
+
+    page_base[page] = base;
+  }
+
+  page_is_user = is_user;
+  io_window_live = expanded ? (((subslot_reg >> 4) & 3) == 0) : (user_base == nullptr);
+}
+#endif // RD_PIN
 
 #ifdef COCO_BOARD
 // Reads served since the cart was switched on. A BASIC signature probe reads
@@ -229,6 +303,12 @@ void __time_critical_func(romulan)(void)
   setup_pio_irq_logic();
 
   while (true) {
+#ifdef RD_PIN
+    if (mapping_dirty) {
+      mapping_dirty = false;
+      refresh_mapping();
+    }
+#endif // RD_PIN
 #ifdef PSM_SENDBUS
     bus.combined = pio_get_fifo(PSM_SENDBUS);
 #else
@@ -243,6 +323,81 @@ void __time_critical_func(romulan)(void)
     DEBUG_PRINTF("ADDR:%04x DATA:%02x CTS:%d SCS:%d RW:%d UN:%d COMBINED:0x%08x\r\n",
                  bus.addr, bus.data, 0, bus.scs, bus.rw, bus.unused, bus.combined);
 #endif
+
+#ifdef RD_PIN
+    if (!bus.rd) {
+      if (BUS_ROM_BASE <= bus.addr && bus.addr < BUS_ROM_TOP) {
+        if (io_window_live && bus.addr >= IO_BASE) {
+          switch (bus.addr & 3) {
+          case IO_GETC:
+            pio_put_fifo(PSM_READ, sio_hw->fifo_rd);
+            break;
+          case IO_STATUS:
+            pio_put_fifo(PSM_READ,
+                         (sio_hw->fifo_st & SIO_FIFO_ST_VLD_BITS ? IO_FLAG_AVAIL : 0x00)
+                         | (user_rom.isClosed() ? IO_FLAG_USERROM_READY : 0x00)
+                         );
+            break;
+          default:
+            pio_put_fifo(PSM_READ, 0xFF);
+            break;
+          }
+        }
+        else {
+          unsigned page = bus.addr >> 14;
+          const uint8_t *base = page_base[page];
+          if (!base)
+            pio_put_fifo(PSM_READ, 0xFF);
+          else if (page_is_user & (1 << page))
+            pio_put_fifo(PSM_READ, base[mapper.calculateOffset(bus, user_rom)]);
+          else
+            pio_put_fifo(PSM_READ, base[bus.addr - BUS_ROM_BASE]);
+        }
+      }
+      else if (expanded && bus.addr == 0xFFFF)
+        pio_put_fifo(PSM_READ, (uint8_t) ~subslot_reg);
+      else if ((page_is_user & (1 << (bus.addr >> 14))) && mapper.isMapped(bus, user_rom))
+        pio_put_fifo(PSM_READ, page_base[bus.addr >> 14][mapper.calculateOffset(bus, user_rom)]);
+    }
+    else if (expanded && bus.addr == 0xFFFF) {
+      subslot_reg = bus.data;
+      mapping_dirty = true;
+    }
+    else if (io_window_live && IO_BASE <= bus.addr && bus.addr < IO_TOP) {
+      switch (bus.addr & 3) {
+      case IO_PUTC:
+        sio_hw->fifo_wr = bus.combined;
+        break;
+      case IO_CONTROL:
+        // Only CONFIG sets the mode: once it has handed off, a stray write (a
+        // game's stack, a RAM probe) must not. FUJICMD_RESET unlocks it.
+        if (user_rom.isActive() || (unapi_enabled && !expanded))
+          break;
+        mapping_dirty = true;
+        if (bus.data & IO_FLAG_ROM_MODE_CMD) {
+          unapi_enabled = bus.data & IO_FLAG_UNAPI_ENABLE;
+          bool want_expanded = bus.data & IO_FLAG_EXPAND_SLOT;
+          if (want_expanded != expanded)
+            subslot_reg = 0;
+          expanded = want_expanded;
+          if (bus.data & IO_FLAG_USERROM_ENABLE) {
+            user_rom.activate();
+            mapper.activate();
+          }
+          else
+            user_rom.deactivate();
+        }
+        else if (bus.data & IO_FLAG_ROM_BANK_CMD)
+          user_rom.selectSegment(bus.data);
+        break;
+      }
+    }
+    else if ((page_is_user & (1 << (bus.addr >> 14))) && mapper.isRemap(bus))
+      mapper.remap(bus);
+
+    last_bus_state = bus.combined;
+    continue;
+#endif // RD_PIN
 
     if (!user_rom.isActive() && rom_ptr != DEFAULT_ROM)
       rom_ptr = DEFAULT_ROM;
@@ -328,25 +483,10 @@ void __time_critical_func(romulan)(void)
         break;
       }
     }
-#ifdef RD_PIN
-    else if (user_rom.isActive() && mapper.isRemap(bus)) {
-      mapper.remap(bus);
-    }
-#endif
     else if (mapper.isMapped(bus, user_rom)) {
-      unsigned rom_offset;
-
-
-#ifndef RD_PIN
       // No banking hardware: serve directly to keep the response path short
-      rom_offset = bus.addr - BUS_ROM_BASE;
-      bus.data = rom_ptr[rom_offset];
+      bus.data = rom_ptr[bus.addr - BUS_ROM_BASE];
       pio_put_fifo(PSM_READ, bus.data);
-#else
-      rom_offset = mapper.calculateOffset(bus, user_rom);
-      bus.data = rom_ptr[rom_offset];
-      pio_put_fifo(PSM_READ, bus.data);
-#endif // RD_PIN
     }
 
     last_bus_state = bus.combined;
@@ -437,9 +577,21 @@ bool process_command(ByteBuffer &buffer)
 
   switch (packet->command()) {
   case FUJICMD_OPEN:
-    if (packet->paramCount() < 1)
-      sendReplyPacket(packet->device(), false, nullptr, 0);
-    else {
+    if (packet->data() && packet->data()->size() >= 5) {
+      // Payload header: stream id, size (32-bit little-endian), optional ROM type.
+      const ByteBuffer &hdr = *packet->data();
+      uint32_t declared = (uint32_t) hdr[1] | ((uint32_t) hdr[2] << 8) |
+                          ((uint32_t) hdr[3] << 16) | ((uint32_t) hdr[4] << 24);
+
+      if (hdr[0] != 0 || declared > ROM_MAX_SEGS * ROM_SEG_SIZE)
+        sendReplyPacket(packet->device(), false, nullptr, 0);
+      else {
+        user_rom.open(0);
+        mapper.setROMType(hdr.size() > 5 ? (fujiROMType_t) hdr[5] : ROM_TYPE_UNKNOWN);
+        sendReplyPacket(packet->device(), true, nullptr, 0);
+      }
+    }
+    else if (packet->paramCount() >= 1) {
       user_rom.open(packet->param(0));
 
       fujiROMType_t type = ROM_TYPE_UNKNOWN;
@@ -452,6 +604,8 @@ bool process_command(ByteBuffer &buffer)
       DEBUG_PRINTF("Opening RAM at 0x%04x\n", offset);
 #endif // VERBOSE_DEBUG
     }
+    else
+      sendReplyPacket(packet->device(), false, nullptr, 0);
     break;
 
   case FUJICMD_WRITE:
@@ -463,7 +617,13 @@ bool process_command(ByteBuffer &buffer)
     break;
 
   case FUJICMD_CLOSE:
-    {
+    if (packet->data() && !packet->data()->empty() && (*packet->data())[0] == 0x01) {
+      // Abort: a partial image must not boot.
+      user_rom.reset();
+      mapping_dirty = true;
+      sendReplyPacket(packet->device(), true, nullptr, 0);
+    }
+    else {
       size_t size = user_rom.close();
 #ifdef COCO_BOARD
       // The host sends no ROM type, so classify by size. It cannot tell a
@@ -488,6 +648,8 @@ bool process_command(ByteBuffer &buffer)
 
   case FUJICMD_RESET:
     user_rom.reset();
+    restore_power_on = true;
+    mapping_dirty = true;
     sendReplyPacket(packet->device(), true, nullptr, 0);
     break;
 
